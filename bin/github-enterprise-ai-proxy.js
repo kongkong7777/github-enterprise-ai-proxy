@@ -32,6 +32,10 @@ import {
   getCopilotSession, refreshCopilotSession, copilotSessionMetadata,
   copilotSessionToQuotaRecord, copilotInferenceHeaders,
 } from '../lib/copilot-session.mjs';
+import {
+  recordRequest, extractUsageFromBody,
+  getUsageSnapshot, premiumQuotaFromSession,
+} from '../lib/copilot-usage.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -436,10 +440,41 @@ async function forwardRequest(req, res, body, pool, account, retried = false) {
         });
         console.log(`[quota-aware] ${account.id} returned 429; marked burnt in cache`);
       }
+      // Tap the response so we can extract `usage` for the dashboard
+      // without changing the byte stream the client sees.
       res.writeHead(upRes.statusCode || 502, upRes.headers);
-      upRes.pipe(res);
-      upRes.on('end', resolve);
-      upRes.on('error', () => resolve());
+      let modelFromBody = null;
+      try {
+        const j = JSON.parse(buf.toString('utf8'));
+        if (typeof j?.model === 'string') modelFromBody = j.model;
+      } catch {}
+      const respChunks = [];
+      let respBytes = 0;
+      upRes.on('data', (chunk) => {
+        respBytes += chunk.length;
+        // Only buffer for usage extraction if response is plausibly small.
+        if (respBytes <= 256 * 1024) respChunks.push(chunk);
+        try { res.write(chunk); } catch {}
+      });
+      upRes.on('end', () => {
+        try { res.end(); } catch {}
+        const ct = upRes.headers['content-type'] || '';
+        const usage = respChunks.length ? extractUsageFromBody(Buffer.concat(respChunks), ct) : null;
+        recordRequest(account.id, {
+          status: upRes.statusCode || 0,
+          model: modelFromBody,
+          usage,
+        });
+        resolve();
+      });
+      upRes.on('error', () => {
+        recordRequest(account.id, {
+          status: upRes.statusCode || 0,
+          model: modelFromBody,
+          usage: null,
+        });
+        resolve();
+      });
     });
     upstream.on('timeout', () => upstream.destroy(new Error(`upstream timeout after ${UPSTREAM_TIMEOUT_MS}ms`)));
     upstream.on('error', (err) => {
@@ -483,13 +518,19 @@ function poolHealth() {
     effectiveDirection: process.env.GHE_FILL_DIRECTION || 'desc',
     currentRoutingTarget: predictRoutingTarget(pool),
     clientKeys: pool.clientKeys.length,
-    accounts: pool.accounts.map(account => ({
-      id: account.id,
-      disabled: !!account.disabled,
-      hasToken: pool.type === 'copilot' ? !!readOauthToken(account) : !!readToken(account),
-      quota: accountQuotaCache.get(account.id) || null,
-      copilotSession: pool.type === 'copilot' ? copilotSessionMetadata(account.id) : null,
-    })),
+    accounts: pool.accounts.map(account => {
+      const session = pool.type === 'copilot' ? copilotSessionMetadata(account.id) : null;
+      const premium = pool.type === 'copilot' ? premiumQuotaFromSession(session) : null;
+      return {
+        id: account.id,
+        disabled: !!account.disabled,
+        hasToken: pool.type === 'copilot' ? !!readOauthToken(account) : !!readToken(account),
+        quota: accountQuotaCache.get(account.id) || null,
+        copilotSession: session,
+        premiumQuota: premium,
+        usage: getUsageSnapshot(account.id),
+      };
+    }),
   }));
 }
 
