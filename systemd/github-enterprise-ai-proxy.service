@@ -1,0 +1,21 @@
+[Unit]
+Description=GitHub Enterprise AI Proxy (PAT pool with quota-aware routing)
+After=network.target
+
+[Service]
+Type=simple
+User=apiadmin
+WorkingDirectory=/home/apiadmin/github-enterprise-ai-proxy
+ExecStart=/usr/bin/node bin/github-enterprise-ai-proxy.js
+EnvironmentFile=-/home/apiadmin/github-enterprise-ai-proxy/.env
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+# Optional: tighten the sandbox once you confirm everything works.
+# ProtectSystem=full
+# ProtectHome=read-only
+# PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

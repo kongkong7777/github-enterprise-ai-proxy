@@ -1,0 +1,29 @@
+{
+  "_comment": "Pool of GitHub PATs the proxy rotates through. Each pool has its own clientKeys (= what callers must put in their Authorization: Bearer header). Multiple pools are useful when you want completely separate quotas for different teams.",
+
+  "defaultPool": "default",
+  "pools": [
+    {
+      "id": "default",
+
+      "_comment_clientKeys": "Caller-side keys. The proxy itself doesn't validate these against any directory — it just routes the request to whichever pool matches. Empty array = single-tenant deploy, anyone hitting the proxy goes to defaultPool.",
+      "clientKeys": [
+        "ghe-proxy-team-keyA",
+        "ghe-proxy-team-keyB"
+      ],
+
+      "_comment_accounts": "Each account holds one GitHub PAT. Provide either token (raw string) or tokenFile (path; supports ~). disabled=true takes the account out of routing without removing it from the file.",
+      "accounts": [
+        {
+          "id":         "alice",
+          "tokenFile":  "~/.ghe/alice.token",
+          "disabled":   false
+        },
+        {
+          "id":         "bob",
+          "token":      "ghp_REPLACE_ME"
+        }
+      ]
+    }
+  ]
+}

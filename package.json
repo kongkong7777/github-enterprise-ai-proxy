@@ -1,0 +1,32 @@
+{
+  "name": "github-enterprise-ai-proxy",
+  "version": "0.1.0",
+  "description": "OpenAI-compatible proxy that routes traffic across a pool of GitHub PATs (GitHub Models, Copilot API, REST). Quota-aware fill_first routing with hot-reload and a Chinese-labeled /quota dashboard.",
+  "type": "module",
+  "bin": {
+    "github-enterprise-ai-proxy": "bin/github-enterprise-ai-proxy.js",
+    "ghe-quota-status": "bin/ghe-quota-status.cjs",
+    "ghe-swap-account": "bin/ghe-swap-account.cjs"
+  },
+  "scripts": {
+    "start": "node bin/github-enterprise-ai-proxy.js",
+    "lint": "node --check bin/github-enterprise-ai-proxy.js && node --check lib/quota-client.mjs && node --check lib/quota-cache.mjs && node --check lib/quota-dashboard.mjs && node --check bin/ghe-quota-status.cjs && node --check bin/ghe-swap-account.cjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kongkong7777/github-enterprise-ai-proxy.git"
+  },
+  "keywords": [
+    "github",
+    "github-enterprise",
+    "github-models",
+    "github-copilot",
+    "openai-compatible",
+    "proxy",
+    "quota"
+  ]
+}
