@@ -28,6 +28,10 @@ import {
   readQuotaCache, writeQuotaCache, QUOTA_CACHE_PATH,
 } from '../lib/quota-cache.mjs';
 import { renderQuotaDashboard } from '../lib/quota-dashboard.mjs';
+import {
+  getCopilotSession, refreshCopilotSession, copilotSessionMetadata,
+  copilotSessionToQuotaRecord, copilotInferenceHeaders,
+} from '../lib/copilot-session.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -56,11 +60,23 @@ const UPSTREAMS = {
 //   {
 //     "defaultPool": "default",
 //     "pools": [
-//       { "id": "default",
+//       { "id": "models",
+//         "type": "models",                           // default
 //         "clientKeys": ["sk-anything-clients-must-send"],
 //         "accounts": [
 //           { "id": "alice", "tokenFile": "~/.ghe/alice.token", "disabled": false },
 //           { "id": "bob",   "token": "ghp_..." }
+//         ]
+//       },
+//       { "id": "copilot",
+//         "type": "copilot",                          // routes to Copilot
+//         "clientKeys": ["sk-team-key"],
+//         "accounts": [
+//           // Each Copilot account holds a long-lived OAuth token (`ghu_…`
+//           // / `gho_…`) obtained via device-flow against the well-known
+//           // Copilot Plugin OAuth client. The proxy mints fresh ~25min
+//           // session tokens per request as needed.
+//           { "id": "kongkong7777", "oauthTokenFile": "~/.ghe/kongkong7777.oauth" }
 //         ]
 //       }
 //     ]
@@ -69,6 +85,7 @@ function expandHome(p) {
   if (!p) return p;
   return p.startsWith('~/') ? path.join(homedir(), p.slice(2)) : p;
 }
+// Token lookup for "models" pools (= the legacy PAT/OAuth Bearer style).
 function readToken(account) {
   if (account.token) return String(account.token).trim();
   if (account.tokenFile) {
@@ -77,16 +94,31 @@ function readToken(account) {
   }
   return '';
 }
+// Token lookup for "copilot" pools — long-lived OAuth (ghu_/gho_).
+function readOauthToken(account) {
+  if (account.oauthToken) return String(account.oauthToken).trim();
+  if (account.oauthTokenFile) {
+    const f = expandHome(account.oauthTokenFile);
+    if (fs.existsSync(f)) return fs.readFileSync(f, 'utf8').trim();
+  }
+  // Fallback: a "copilot" pool can also reuse the plain `tokenFile` slot
+  // so an operator who already has a one-token deployment doesn't need
+  // to rename the file.
+  return readToken(account);
+}
 function loadProxyConfig() {
   const raw = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'));
   const poolsInput = Array.isArray(raw.pools) ? raw.pools : [];
   const pools = poolsInput.map((p, i) => ({
     id: p.id || `pool-${i + 1}`,
+    type: (p.type || 'models').toLowerCase(),
     clientKeys: Array.isArray(p.clientKeys) ? p.clientKeys.slice() : [],
     accounts: (p.accounts || []).map((a, j) => ({
       id: a.id || `account-${j + 1}`,
       token: a.token || null,
       tokenFile: a.tokenFile || null,
+      oauthToken: a.oauthToken || null,
+      oauthTokenFile: a.oauthTokenFile || null,
       disabled: !!a.disabled,
     })),
     nextIndex: 0,
@@ -139,6 +171,26 @@ async function refreshAllQuotas() {
   const queries = [];
   for (const pool of proxyConfig.pools) {
     for (const account of pool.accounts) {
+      if (pool.type === 'copilot') {
+        const oauth = readOauthToken(account);
+        if (!oauth) {
+          accountQuotaCache.set(account.id, { ok: false, error: 'missing oauthToken', queriedAt: Date.now() });
+          continue;
+        }
+        // For Copilot pools the "quota probe" IS the session-token mint:
+        // it's the same call used for every inference, just driven proactively
+        // so the dashboard knows sku / chat_enabled / endpoint.
+        queries.push(
+          getCopilotSession(account.id, oauth, { force: true })
+            .then(() => {
+              const meta = copilotSessionMetadata(account.id);
+              accountQuotaCache.set(account.id, { ...copilotSessionToQuotaRecord(meta), queriedAt: Date.now() });
+            })
+            .catch(e => accountQuotaCache.set(account.id, { ok: false, error: e.message, queriedAt: Date.now() }))
+        );
+        continue;
+      }
+      // Default: "models" pool — REST /rate_limit + /catalog/models probe.
       const token = readToken(account);
       if (!token) {
         accountQuotaCache.set(account.id, { ok: false, error: 'missing token', queriedAt: Date.now() });
@@ -279,55 +331,124 @@ function writeJson(res, code, obj) {
   res.end(body);
 }
 
-function forwardRequest(req, res, body, account, token, retried = false) {
-  const route = pickUpstream(req.url.split('?')[0]);
-  if (!route) {
-    return writeJson(res, 404, { error: { message: `no upstream mapped for path ${req.url}`, type: 'routing_error' } });
+// Translate "/v1/chat/completions" etc. into the path the configured
+// upstream wants. For Copilot the upstream host comes from the session
+// itself — we only need the trailing path.
+function copilotPathFor(reqPath) {
+  // Strip a leading "/v1" or "/copilot" prefix; the rest goes verbatim.
+  const stripped = reqPath
+    .replace(/^\/v1\b/, '')
+    .replace(/^\/copilot\b/, '');
+  return stripped || '/chat/completions';
+}
+
+async function forwardRequest(req, res, body, pool, account, retried = false) {
+  // Resolve { upstream host, upstream path, auth header, extra headers } based
+  // on pool type.
+  const reqPathOnly = req.url.split('?')[0];
+  const search = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+
+  let upstreamHost, upstreamPath, authValue, extraHeaders = {};
+
+  if (pool.type === 'copilot') {
+    const oauth = readOauthToken(account);
+    if (!oauth) {
+      return writeJson(res, 503, { error: { message: `account "${account.id}" has no oauthToken`, type: 'config_error' } });
+    }
+    let session;
+    try {
+      session = await getCopilotSession(account.id, oauth, { force: retried });
+    } catch (e) {
+      return writeJson(res, e.status || 502, { error: { message: `copilot session refresh failed: ${e.message}`, type: 'auth_error' } });
+    }
+    if (!session?.token) {
+      return writeJson(res, 502, { error: { message: 'copilot session response missing token', type: 'auth_error' } });
+    }
+    // Pick the inference endpoint Copilot returned — for Enterprise
+    // licenses this is `api.enterprise.githubcopilot.com`, individual is
+    // plain `api.githubcopilot.com`.
+    const apiUrl = session.endpoints?.api;
+    if (!apiUrl) {
+      return writeJson(res, 502, { error: { message: 'copilot session missing endpoints.api', type: 'auth_error' } });
+    }
+    const u = new URL(apiUrl);
+    upstreamHost = u.hostname;
+    upstreamPath = u.pathname.replace(/\/+$/, '') + copilotPathFor(reqPathOnly);
+    authValue = `Bearer ${session.token}`;
+    extraHeaders = copilotInferenceHeaders();
+  } else {
+    // "models" pool — passthrough Bearer + path mapping table.
+    const route = pickUpstream(reqPathOnly);
+    if (!route) {
+      return writeJson(res, 404, { error: { message: `no upstream mapped for path ${req.url}`, type: 'routing_error' } });
+    }
+    const token = readToken(account);
+    if (!token) {
+      return writeJson(res, 503, { error: { message: `account "${account.id}" has no token`, type: 'config_error' } });
+    }
+    upstreamHost = route.host;
+    upstreamPath = route.path;
+    authValue = `Bearer ${token}`;
   }
+
   const headers = { ...req.headers };
   delete headers.host;
   delete headers['content-length'];
-  headers.authorization = `Bearer ${token}`;
   delete headers['x-api-key'];
-  headers['user-agent'] = headers['user-agent'] || 'github-enterprise-ai-proxy';
+  for (const [k, v] of Object.entries(extraHeaders)) headers[k] = v;
+  headers.authorization = authValue;
+  headers['user-agent'] = headers['user-agent'] || extraHeaders['User-Agent'] || 'github-enterprise-ai-proxy';
 
   const buf = Buffer.from(body || '');
   if (buf.length > 0) headers['content-length'] = String(buf.length);
 
-  const search = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
-  const upstream = https.request({
-    hostname: route.host,
-    port: 443,
-    path: route.path + search,
-    method: req.method,
-    headers,
-    timeout: UPSTREAM_TIMEOUT_MS,
-  }, (upRes) => {
-    if (upRes.statusCode === 429) {
-      // Rate-limited — mark this PAT burnt in cache so the next request
-      // routes around it without waiting for the periodic refresh.
-      const prev = accountQuotaCache.get(account.id);
-      accountQuotaCache.set(account.id, {
-        ...(prev || {}),
-        ok: true,
-        used: prev?.total || 1,
-        total: prev?.total || 1,
-        remaining: 0,
-        used_pct: 1.001,
-        queriedAt: Date.now(),
-        _from429: true,
-      });
-      console.log(`[quota-aware] ${account.id} returned 429; marked burnt in cache`);
-    }
-    res.writeHead(upRes.statusCode || 502, upRes.headers);
-    upRes.pipe(res);
+  return new Promise((resolve) => {
+    const upstream = https.request({
+      hostname: upstreamHost,
+      port: 443,
+      path: upstreamPath + search,
+      method: req.method,
+      headers,
+      timeout: UPSTREAM_TIMEOUT_MS,
+    }, async (upRes) => {
+      if (upRes.statusCode === 401 && pool.type === 'copilot' && !retried) {
+        // Session expired between our check and the call — drain the
+        // upstream response, force a session refresh, and retry once.
+        upRes.resume();
+        try {
+          await forwardRequest(req, res, body, pool, account, true);
+        } catch (e) {
+          if (!res.headersSent) writeJson(res, 502, { error: { message: e.message, type: 'forward_error' } });
+        }
+        return resolve();
+      }
+      if (upRes.statusCode === 429) {
+        const prev = accountQuotaCache.get(account.id);
+        accountQuotaCache.set(account.id, {
+          ...(prev || {}),
+          ok: true,
+          used: prev?.total || 1,
+          total: prev?.total || 1,
+          remaining: 0,
+          used_pct: 1.001,
+          queriedAt: Date.now(),
+          _from429: true,
+        });
+        console.log(`[quota-aware] ${account.id} returned 429; marked burnt in cache`);
+      }
+      res.writeHead(upRes.statusCode || 502, upRes.headers);
+      upRes.pipe(res);
+      upRes.on('end', resolve);
+      upRes.on('error', () => resolve());
+    });
+    upstream.on('timeout', () => upstream.destroy(new Error(`upstream timeout after ${UPSTREAM_TIMEOUT_MS}ms`)));
+    upstream.on('error', (err) => {
+      if (!res.headersSent) writeJson(res, 502, { error: { message: err.message, type: 'upstream_error' } });
+      resolve();
+    });
+    if (buf.length > 0) upstream.write(buf);
+    upstream.end();
   });
-  upstream.on('timeout', () => upstream.destroy(new Error(`upstream timeout after ${UPSTREAM_TIMEOUT_MS}ms`)));
-  upstream.on('error', (err) => {
-    if (!res.headersSent) writeJson(res, 502, { error: { message: err.message, type: 'upstream_error' } });
-  });
-  if (buf.length > 0) upstream.write(buf);
-  upstream.end();
 }
 
 // ─── Auth helpers for /quota dashboard ────────────────────────────────────
@@ -357,6 +478,7 @@ function quotaAuthOK(req) {
 function poolHealth() {
   return proxyConfig.pools.map(pool => ({
     id: pool.id,
+    type: pool.type,
     effectiveStrategy: process.env.GHE_ROUTING_STRATEGY || 'fill_first',
     effectiveDirection: process.env.GHE_FILL_DIRECTION || 'desc',
     currentRoutingTarget: predictRoutingTarget(pool),
@@ -364,8 +486,9 @@ function poolHealth() {
     accounts: pool.accounts.map(account => ({
       id: account.id,
       disabled: !!account.disabled,
-      hasToken: !!readToken(account),
+      hasToken: pool.type === 'copilot' ? !!readOauthToken(account) : !!readToken(account),
       quota: accountQuotaCache.get(account.id) || null,
+      copilotSession: pool.type === 'copilot' ? copilotSessionMetadata(account.id) : null,
     })),
   }));
 }
@@ -408,20 +531,22 @@ const server = http.createServer(async (req, res) => {
     let pool;
     try { pool = resolvePool(req); }
     catch (e) { return writeJson(res, e.status || 401, { error: { message: e.message, type: 'auth_error' } }); }
-    let account, token;
+    let account;
     try {
       account = resolveAccount(req, pool);
-      token = readToken(account);
-      if (!token) throw Object.assign(new Error(`account "${account.id}" has no token`), { status: 503 });
     } catch (e) {
       return writeJson(res, e.status || 503, { error: { message: e.message, type: 'routing_error' } });
     }
 
     const chunks = [];
     req.on('data', c => chunks.push(c));
-    req.on('end', () => {
+    req.on('end', async () => {
       const body = Buffer.concat(chunks);
-      forwardRequest(req, res, body, account, token);
+      try {
+        await forwardRequest(req, res, body, pool, account);
+      } catch (e) {
+        if (!res.headersSent) writeJson(res, 502, { error: { message: e.message, type: 'forward_error' } });
+      }
     });
     req.on('error', e => writeJson(res, 400, { error: { message: e.message, type: 'request_error' } }));
   } catch (e) {

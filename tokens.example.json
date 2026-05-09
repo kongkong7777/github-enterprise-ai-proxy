@@ -1,27 +1,35 @@
 {
-  "_comment": "Pool of GitHub PATs the proxy rotates through. Each pool has its own clientKeys (= what callers must put in their Authorization: Bearer header). Multiple pools are useful when you want completely separate quotas for different teams.",
+  "_comment": "Pool of GitHub credentials the proxy rotates through. Two pool types: 'copilot' (Copilot Enterprise / Pro session-token flow, in-plan) and 'models' (GitHub Models marketplace PAT flow, pay-as-you-go). Most operators want a copilot pool.",
 
-  "defaultPool": "default",
+  "defaultPool": "copilot",
   "pools": [
     {
-      "id": "default",
-
-      "_comment_clientKeys": "Caller-side keys. The proxy itself doesn't validate these against any directory — it just routes the request to whichever pool matches. Empty array = single-tenant deploy, anyone hitting the proxy goes to defaultPool.",
+      "id": "copilot",
+      "type": "copilot",
+      "_comment_type": "Copilot pool: each account holds a long-lived OAuth token (`ghu_…` / `gho_…`) obtained via device-flow against the well-known Copilot Plugin OAuth client (Iv1.b507a08c87ecfe98). Per-request the proxy mints a ~25min session token via /copilot_internal/v2/token and forwards to api.enterprise.githubcopilot.com (or api.githubcopilot.com for individual seats). All inference is billed against the user's Copilot subscription — no pay-as-you-go.",
       "clientKeys": [
-        "ghe-proxy-team-keyA",
+        "ghe-proxy-team-keyA"
+      ],
+      "accounts": [
+        {
+          "id":             "kongkong7777",
+          "oauthTokenFile": "~/.ghe/kongkong7777.oauth"
+        }
+      ]
+    },
+
+    {
+      "id": "models",
+      "type": "models",
+      "_comment_type": "Models pool: each account holds a fine-grained PAT with `Models: Read` permission. Routes /v1/chat/completions etc. to models.github.ai. Usage is billed pay-as-you-go via the user's Models budget (set GHE_QUOTA_BURNT_THRESHOLD to control when accounts are taken out of rotation). Leave commented out / empty if you only want Copilot Enterprise.",
+      "clientKeys": [
         "ghe-proxy-team-keyB"
       ],
-
-      "_comment_accounts": "Each account holds one GitHub PAT. Provide either token (raw string) or tokenFile (path; supports ~). disabled=true takes the account out of routing without removing it from the file.",
       "accounts": [
         {
           "id":         "alice",
           "tokenFile":  "~/.ghe/alice.token",
           "disabled":   false
-        },
-        {
-          "id":         "bob",
-          "token":      "ghp_REPLACE_ME"
         }
       ]
     }

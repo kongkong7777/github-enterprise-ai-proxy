@@ -10,7 +10,7 @@
   },
   "scripts": {
     "start": "node bin/github-enterprise-ai-proxy.js",
-    "lint": "node --check bin/github-enterprise-ai-proxy.js && node --check lib/quota-client.mjs && node --check lib/quota-cache.mjs && node --check lib/quota-dashboard.mjs && node --check bin/ghe-quota-status.cjs && node --check bin/ghe-swap-account.cjs"
+    "lint": "node --check bin/github-enterprise-ai-proxy.js && node --check lib/quota-client.mjs && node --check lib/quota-cache.mjs && node --check lib/quota-dashboard.mjs && node --check lib/copilot-session.mjs && node --check bin/ghe-quota-status.cjs && node --check bin/ghe-swap-account.cjs"
   },
   "engines": {
     "node": ">=20.0.0"
