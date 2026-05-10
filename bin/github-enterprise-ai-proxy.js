@@ -32,6 +32,7 @@ import {
   getCopilotSession, refreshCopilotSession, copilotSessionMetadata,
   copilotSessionToQuotaRecord, copilotInferenceHeaders,
   getCopilotUserInfo, copilotUserInfoMetadata,
+  parseQuotaHeadersFromResponse, applyQuotaHeadersToRecord,
 } from '../lib/copilot-session.mjs';
 import {
   recordRequest, extractUsageFromBody,
@@ -248,6 +249,62 @@ function runManualOp(scriptName, args, { timeoutMs = 30_000 } = {}) {
     });
     child.on('error', (e) => { clearTimeout(t); reject(e); });
   });
+}
+
+// Apply quota snapshots embedded in SSE stream events to accountQuotaCache.
+// Mirrors applyQuotaHeadersToRecord but for the JSON shape that comes from
+// `response.completed.copilot_quota_snapshots`. Handles the same string-vs-
+// number / -1-as-unlimited / premium_interactions-then-premium_models
+// fallback rules.
+function applyStreamSnapshotsToCache(accountId, snaps) {
+  const prev = accountQuotaCache.get(accountId);
+  const record = prev ? { ...prev } : { ok: true, schema: 'copilot-stream' };
+  record.queriedAt = Date.now();
+  record._fromStream = true;
+  const out = { ...(record.quota_snapshots || {}) };
+  for (const [bucket, s] of Object.entries(snaps || {})) {
+    if (!s || typeof s !== 'object') continue;
+    const entRaw = s.entitlement;
+    const ent = (entRaw == null || entRaw === '') ? NaN : Number(entRaw);
+    const remRaw = s.remaining;
+    const rem = (remRaw == null || remRaw === '') ? NaN : Number(remRaw);
+    const unlimited = !!s.unlimited || ent === -1;
+    out[bucket] = {
+      quota_id: bucket,
+      unlimited,
+      entitlement: Number.isFinite(ent) && ent !== -1 ? ent : null,
+      remaining: Number.isFinite(rem) ? rem : null,
+      used: (Number.isFinite(ent) && Number.isFinite(rem) && ent !== -1) ? Math.max(0, ent - rem) : null,
+      used_pct: Number.isFinite(s.percent_remaining) ? Math.max(0, 1 - s.percent_remaining / 100) : null,
+      overage_count: Number(s.overage_count) || 0,
+      overage_permitted: !!s.overage_permitted,
+      has_quota: !unlimited,
+    };
+  }
+  record.quota_snapshots = out;
+
+  // Promote metered bucket to top-level for routing.
+  const metered = snaps?.premium_interactions || snaps?.premium_models;
+  if (metered) {
+    const ent = Number(metered.entitlement);
+    if (ent === -1) record.unlimited = true;
+    else if (Number.isFinite(ent) && ent > 0) {
+      const rem = Number.isFinite(Number(metered.remaining))
+        ? Number(metered.remaining)
+        : Math.round(((Number(metered.percent_remaining) || 0) * ent) / 100);
+      const used = Math.max(0, ent - rem);
+      record.total = ent;
+      record.remaining = rem;
+      record.used = used;
+      record.used_pct = ent > 0 ? used / ent : 0;
+    }
+    const resetCand = metered.reset_date || metered.quota_reset_at;
+    if (resetCand) {
+      const t = Date.parse(resetCand);
+      if (Number.isFinite(t)) record.reset_ms = t;
+    }
+  }
+  accountQuotaCache.set(accountId, record);
 }
 
 // ─── Quota cache + periodic refresh ───────────────────────────────────────
@@ -606,6 +663,21 @@ async function forwardRequest(req, res, body, pool, account, retried = false) {
         });
         console.log(`[quota-aware] ${account.id} returned 429; marked burnt in cache`);
       }
+      // Sniff `x-quota-snapshot-*` response headers BEFORE we forward
+      // them: every Copilot inference response carries a fresh snapshot of
+      // premium_interactions / premium_models / chat / completions. This
+      // makes the cache near-realtime instead of 5-min stale (matches the
+      // VSCode extension's own behaviour and parity with jbai-proxy's SSE
+      // QuotaMetadata sniffing).
+      try {
+        const updated = applyQuotaHeadersToRecord(
+          accountQuotaCache.get(account.id),
+          upRes.headers,
+          { resetMsHint: accountQuotaCache.get(account.id)?.reset_ms }
+        );
+        if (updated) accountQuotaCache.set(account.id, updated);
+      } catch (e) { /* never let a sniff error break the response */ }
+
       // Tap the response so we can extract `usage` for the dashboard
       // without changing the byte stream the client sees.
       res.writeHead(upRes.statusCode || 502, upRes.headers);
@@ -616,15 +688,43 @@ async function forwardRequest(req, res, body, pool, account, retried = false) {
       } catch {}
       const respChunks = [];
       let respBytes = 0;
+      // SSE buffer for stream-event quota sniffing. Carry over partial
+      // lines across chunk boundaries.
+      const ct = upRes.headers['content-type'] || '';
+      const isSSE = /text\/event-stream/i.test(ct);
+      let sseBuf = '';
       upRes.on('data', (chunk) => {
         respBytes += chunk.length;
         // Only buffer for usage extraction if response is plausibly small.
         if (respBytes <= 256 * 1024) respChunks.push(chunk);
         try { res.write(chunk); } catch {}
+        // SSE in-flight sniffing: scan `data:` lines for embedded
+        // `copilot_quota_snapshots` and update the cache mid-stream.
+        if (isSSE) {
+          sseBuf += chunk.toString('utf8');
+          let nl;
+          while ((nl = sseBuf.indexOf('\n')) >= 0) {
+            const line = sseBuf.slice(0, nl).trim();
+            sseBuf = sseBuf.slice(nl + 1);
+            if (!line.startsWith('data:')) continue;
+            const payload = line.slice(5).trim();
+            if (!payload || payload === '[DONE]') continue;
+            try {
+              const evt = JSON.parse(payload);
+              const snaps = evt?.copilot_quota_snapshots
+                || evt?.response?.copilot_quota_snapshots;
+              if (snaps && typeof snaps === 'object') {
+                applyStreamSnapshotsToCache(account.id, snaps);
+              }
+            } catch { /* not JSON, skip */ }
+          }
+          // Keep sseBuf bounded so a runaway non-newline stream can't
+          // exhaust memory.
+          if (sseBuf.length > 16 * 1024) sseBuf = sseBuf.slice(-8 * 1024);
+        }
       });
       upRes.on('end', () => {
         try { res.end(); } catch {}
-        const ct = upRes.headers['content-type'] || '';
         const usage = respChunks.length ? extractUsageFromBody(Buffer.concat(respChunks), ct) : null;
         recordRequest(account.id, {
           status: upRes.statusCode || 0,
