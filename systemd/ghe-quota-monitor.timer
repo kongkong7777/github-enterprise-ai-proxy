@@ -1,0 +1,12 @@
+[Unit]
+Description=Run ghe-quota-monitor every few minutes for bidirectional pool maintenance.
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

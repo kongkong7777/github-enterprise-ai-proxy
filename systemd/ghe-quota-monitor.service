@@ -1,0 +1,21 @@
+[Unit]
+Description=GitHub Enterprise AI proxy quota monitor — auto-recover disabled accounts on quota reset; swap depleted accounts; pre-stage Entra candidates.
+After=github-enterprise-ai-proxy.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=apiadmin
+WorkingDirectory=/home/apiadmin/github-enterprise-ai-proxy
+Environment=GHE_RELOAD_URL=http://127.0.0.1:18081/quota/reload
+# When the pool drains AND --auto-create is set, the monitor will
+# provision the next Entra-side EMU candidate. Names auto-roll using
+# the unix timestamp; tweak if you want predictable IDs.
+# Environment=GHE_NOTIFY_CMD=/usr/local/bin/ghe-notify-slack
+ExecStart=/usr/bin/node /home/apiadmin/github-enterprise-ai-proxy/bin/ghe-quota-monitor.cjs --auto-create --next-name dev$(date +%%s) --next-display "rotation pool member"
+# 0=ok, 2=pool drained (event was already emitted; don't mark
+# failed and spam the systemd journal).
+SuccessExitStatus=0 2
+
+[Install]
+WantedBy=multi-user.target
