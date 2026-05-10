@@ -103,7 +103,10 @@ http://127.0.0.1:18081/quota
 - **`pools`** — independent groups of PATs with their own quota and client-keys. Useful when several teams share the proxy but should not bleed into each other's quota.
 - **`clientKeys`** — what callers must put in `Authorization: Bearer <key>`. The proxy uses this to pick which pool to draw from.
 - **`accounts[].token`** vs **`tokenFile`** — either inline the PAT or point at a file (recommended; `~` is expanded). Files should be `chmod 600`.
+- **`accounts[].oauthTokenFile`** (Copilot pools) — long-lived `ghu_…` OAuth token from `ghe-mint-oauth.cjs`. Drives both inference (session is minted per request) and the quota probe at `/copilot_internal/user`.
+- **`accounts[].usedPctCap`** (optional, range `(0, 1]`) — per-account ceiling on `premium_interactions` usage that overrides the global `GHE_QUOTA_BURNT_THRESHOLD`. e.g. `0.5` means "cap this user at 50% of their monthly premium-requests allowance". Routing filter, proactive-swap trigger, and the dashboard's warn/bad colours all scale to this cap. Mirrors the JBA proxy's `usedPctCap`.
 - **`disabled: true`** — skip this account in routing without removing it from the file.
+- **`disabledReason`** / **`disabledAt`** / **`lastReEnabledAt`** / **`lastReEnabledReason`** — bookkeeping fields written by the swap / unswap / quota-monitor scripts. Distinguishes "monitor auto-disabled this; auto-recover when premium % drops" from "operator disabled this; leave alone". Preserved across restarts.
 
 ## Routing
 
@@ -123,6 +126,8 @@ Override:
 
 ## Quota check
 
+### `models` pools (`GitHub Models` PATs)
+
 Per-PAT quota comes from `GET /rate_limit`:
 
 ```jsonc
@@ -132,9 +137,30 @@ Per-PAT quota comes from `GET /rate_limit`:
 }
 ```
 
-The proxy also pings `GET /catalog/models` to confirm the PAT has Models scope (rendered as `Models ✓` / `✗` in the dashboard). 401/403 on `/rate_limit` is treated as a dead PAT and the account is shown red on the dashboard.
+The proxy also pings `GET /catalog/models` to confirm the PAT has Models scope. 401/403 on `/rate_limit` is treated as a dead PAT.
 
-A 429 from any forwarded request **immediately** marks that PAT as burnt in the in-memory cache, so the next request routes around it without waiting for the next 5-min sweep.
+### `copilot` pools (Copilot Enterprise / Business via OAuth)
+
+Each Copilot account holds a long-lived `ghu_…` OAuth token. The proxy's per-account quota probe is **two parallel calls** on every refresh cycle:
+
+```text
+GET /copilot_internal/v2/token   →  session token, sku, chat_enabled,
+                                    expires_at, endpoints
+GET /copilot_internal/user       →  copilot_plan, organization_login_list,
+                                    quota_reset_date_utc,
+                                    quota_snapshots: {
+                                      premium_interactions: { entitlement,
+                                                               remaining,
+                                                               percent_remaining,
+                                                               overage_count },
+                                      chat:        { unlimited, … },
+                                      completions: { unlimited, … }
+                                    }
+```
+
+`premium_interactions` is the bucket the **VSCode Copilot extension's "Included premium requests N% used · Resets MMM DD" UI shows** — same numbers, same source. The proxy promotes that bucket to the top-level `used` / `total` / `remaining` / `used_pct` fields so the JBA-style routing logic compares the right thing. The other two buckets (chat / completions) are unlimited under `copilot_enterprise_seat_multi_quota`; we still track them so the dashboard can render them.
+
+A 429 / 477 from any forwarded request immediately marks that account as burnt in the in-memory cache (no waiting for the next sweep).
 
 ## Endpoints
 
@@ -144,15 +170,19 @@ Anything matching the routing table above is forwarded through.
 
 ### Operations
 
-| Method | Path              | Purpose                                                      |
-|--------|-------------------|--------------------------------------------------------------|
-| GET    | `/health`         | Lightweight: is the proxy alive, what's the pool look like?  |
-| GET    | `/quota.json`     | JSON snapshot of every pool / account / quota                |
-| GET    | `/quota`          | HTML dashboard (auth-protected if `GHE_QUOTA_AUTH` is set)   |
-| POST   | `/quota/refresh`  | Force an immediate sweep of every PAT                        |
-| POST   | `/quota/reload`   | Re-read `tokens.json` in-process; **no service restart**     |
+| Method | Path                         | Purpose                                                      |
+|--------|------------------------------|--------------------------------------------------------------|
+| GET    | `/health`                    | Lightweight: is the proxy alive, what's the pool look like?  |
+| GET    | `/quota.json`                | JSON snapshot of every pool / account / quota / enterprise   |
+| GET    | `/quota`                     | HTML dashboard (auth-protected if `GHE_QUOTA_AUTH` is set)   |
+| POST   | `/quota/refresh`             | Force an immediate sweep of every PAT / OAuth token          |
+| POST   | `/quota/reload`              | Re-read `tokens.json` in-process; **no service restart**     |
+| POST   | `/quota/swap?id=<id>`        | Manually swap-away an account (calls `ghe-swap-account.cjs`) |
+| POST   | `/quota/enable?id=<id>`      | Manually re-enable a disabled account (`ghe-unswap-account.cjs`) |
 
 If `GHE_QUOTA_AUTH=user:pass[,user:pass]` is set, all `/quota*` endpoints require Basic auth.
+
+The HTML dashboard exposes "切换走" / "启用" buttons next to each account that fire those `/quota/swap` and `/quota/enable` endpoints. They use a two-stage **arm-and-confirm** pattern (first click arms the button for 6 s, second click within that window actually fires) so the buttons are also safe to drive over CDP/automation — same pattern the JBA proxy uses.
 
 ## CLI tools
 

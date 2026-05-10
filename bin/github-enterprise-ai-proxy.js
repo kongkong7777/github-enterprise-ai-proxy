@@ -31,6 +31,7 @@ import { renderQuotaDashboard } from '../lib/quota-dashboard.mjs';
 import {
   getCopilotSession, refreshCopilotSession, copilotSessionMetadata,
   copilotSessionToQuotaRecord, copilotInferenceHeaders,
+  getCopilotUserInfo, copilotUserInfoMetadata,
 } from '../lib/copilot-session.mjs';
 import {
   recordRequest, extractUsageFromBody,
@@ -44,9 +45,32 @@ const __dirname = path.dirname(__filename);
 const PORT = parseInt(process.env.GHE_PROXY_PORT || '18081', 10);
 const TOKENS_FILE = process.env.GHE_TOKENS_FILE
   || path.resolve(__dirname, '..', 'tokens.json');
+// Public-facing path prefix when the dashboard is reverse-proxied behind a
+// path-rewriting nginx (e.g. `https://example.com/ghe-quota/...` → here's
+// `/quota/...`). The dashboard JS prepends this to its fetch() URLs so the
+// "立即刷新" / 切换走 / 启用 buttons work end-to-end. Empty string =
+// directly mounted at /, no rewrite (default).
+const PUBLIC_BASE_PATH = (process.env.GHE_PUBLIC_BASE_PATH || '').replace(/\/+$/, '');
 const QUOTA_REFRESH_MS = parseInt(process.env.GHE_QUOTA_REFRESH_MS || String(5 * 60 * 1000), 10);
 const QUOTA_BURNT_THRESHOLD = parseFloat(process.env.GHE_QUOTA_BURNT_THRESHOLD || '0.95');
+const QUOTA_PROACTIVE_SWAP_AT = parseFloat(process.env.GHE_QUOTA_PROACTIVE_SWAP_AT || '0.9');
 const ROUTING_HYSTERESIS = parseFloat(process.env.GHE_ROUTING_HYSTERESIS || '0.01');
+
+// ─── Per-account quota cap (parity with jbai-proxy `usedPctCap`) ─────────
+// tokens.json `accounts[].usedPctCap` may set a per-account ceiling that's
+// stricter than QUOTA_BURNT_THRESHOLD. Use case: keep one account's
+// premium-requests usage below 50% to leave headroom for end-of-cycle
+// surges, or to honour a "shared seat at 50%" policy. Values must be in
+// (0, 1]; out-of-range values fall back to the global threshold.
+function accountBurntCap(account) {
+  const v = account?.usedPctCap;
+  if (typeof v === 'number' && v > 0 && v <= 1) return v;
+  return QUOTA_BURNT_THRESHOLD;
+}
+function accountProactiveCap(account) {
+  const burnt = accountBurntCap(account);
+  return Math.min(QUOTA_PROACTIVE_SWAP_AT, Math.max(0.05, burnt - 0.05));
+}
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.GHE_UPSTREAM_TIMEOUT_MS || String(10 * 60 * 1000), 10);
 
 // Enterprise-level Copilot license probe. Optional — enabled when
@@ -126,14 +150,31 @@ function loadProxyConfig() {
     id: p.id || `pool-${i + 1}`,
     type: (p.type || 'models').toLowerCase(),
     clientKeys: Array.isArray(p.clientKeys) ? p.clientKeys.slice() : [],
-    accounts: (p.accounts || []).map((a, j) => ({
-      id: a.id || `account-${j + 1}`,
-      token: a.token || null,
-      tokenFile: a.tokenFile || null,
-      oauthToken: a.oauthToken || null,
-      oauthTokenFile: a.oauthTokenFile || null,
-      disabled: !!a.disabled,
-    })),
+    accounts: (p.accounts || []).map((a, j) => {
+      const out = {
+        id: a.id || `account-${j + 1}`,
+        token: a.token || null,
+        tokenFile: a.tokenFile || null,
+        oauthToken: a.oauthToken || null,
+        oauthTokenFile: a.oauthTokenFile || null,
+        disabled: !!a.disabled,
+      };
+      // Per-account quota cap. Validate (0, 1]; out-of-range falls back
+      // to the global threshold via accountBurntCap().
+      if (typeof a.usedPctCap === 'number' && a.usedPctCap > 0 && a.usedPctCap <= 1) {
+        out.usedPctCap = a.usedPctCap;
+      }
+      // Preserve quota-monitor bookkeeping (parity with jbai-proxy):
+      // these fields are written by ghe-swap-account / ghe-unswap-account
+      // so the bidirectional recovery loop knows whether a `disabled: true`
+      // came from the monitor (auto-recover when cap drops) or from a
+      // human (leave it alone).
+      if (typeof a.disabledReason === 'string') out.disabledReason = a.disabledReason;
+      if (typeof a.disabledAt === 'number') out.disabledAt = a.disabledAt;
+      if (typeof a.lastReEnabledAt === 'number') out.lastReEnabledAt = a.lastReEnabledAt;
+      if (typeof a.lastReEnabledReason === 'string') out.lastReEnabledReason = a.lastReEnabledReason;
+      return out;
+    }),
     nextIndex: 0,
     _lastSelectedId: null,
   }));
@@ -175,6 +216,40 @@ function reloadProxyConfig() {
   return { ok: true, totalAccounts: newIds.size, added, removed };
 }
 
+// ─── Manual ops helper (used by /quota/swap and /quota/enable) ──────────
+// Spawns one of the bin/ghe-*.cjs CLIs and resolves once it exits. We
+// don't fire-and-forget like the legacy /failover path because the HTTP
+// caller wants to know if the swap landed before the response returns.
+function runManualOp(scriptName, args, { timeoutMs = 30_000 } = {}) {
+  const scriptPath = path.resolve(__dirname, scriptName);
+  if (!fs.existsSync(scriptPath)) {
+    return Promise.reject(new Error(`script missing: ${scriptPath}`));
+  }
+  return new Promise((resolve, reject) => {
+    const child = spawn('node', [scriptPath, ...args], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env },
+    });
+    let out = '', err = '';
+    child.stdout.on('data', (b) => { out += b.toString(); });
+    child.stderr.on('data', (b) => { err += b.toString(); });
+    const t = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`${scriptName} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.on('exit', (code) => {
+      clearTimeout(t);
+      if (code === 0 || code === 2) {
+        // exit 2 from the unswap script means "nothing to do" — also OK.
+        resolve({ code, stdout: out, stderr: err });
+      } else {
+        reject(new Error(`${scriptName} exit ${code}: ${err.trim() || out.trim() || 'no output'}`));
+      }
+    });
+    child.on('error', (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
 // ─── Quota cache + periodic refresh ───────────────────────────────────────
 const accountQuotaCache = new Map(); // accountId → quota record
 let lastQuotaRefreshAt = 0;
@@ -190,14 +265,26 @@ async function refreshAllQuotas() {
           accountQuotaCache.set(account.id, { ok: false, error: 'missing oauthToken', queriedAt: Date.now() });
           continue;
         }
-        // For Copilot pools the "quota probe" IS the session-token mint:
-        // it's the same call used for every inference, just driven proactively
-        // so the dashboard knows sku / chat_enabled / endpoint.
+        // For Copilot pools the per-account probe is two calls in parallel:
+        //   /copilot_internal/v2/token  → session metadata (chat_enabled,
+        //                                  sku, expires_at, endpoints).
+        //   /copilot_internal/user     → premium_interactions quota
+        //                                  (entitlement / remaining /
+        //                                  reset_at) — same data the
+        //                                  VSCode extension polls for the
+        //                                  "X% used · Resets MMM DD" UI.
         queries.push(
-          getCopilotSession(account.id, oauth, { force: true })
+          Promise.all([
+            getCopilotSession(account.id, oauth, { force: true }),
+            getCopilotUserInfo(account.id, oauth, { force: true }).catch(e => {
+              console.warn(`[user-info] ${account.id}: ${e.message}`);
+              return null; // don't fail the whole probe — session is enough for routing
+            }),
+          ])
             .then(() => {
               const meta = copilotSessionMetadata(account.id);
-              accountQuotaCache.set(account.id, { ...copilotSessionToQuotaRecord(meta), queriedAt: Date.now() });
+              const userInfo = copilotUserInfoMetadata(account.id);
+              accountQuotaCache.set(account.id, { ...copilotSessionToQuotaRecord(meta, userInfo), queriedAt: Date.now() });
             })
             .catch(e => accountQuotaCache.set(account.id, { ok: false, error: e.message, queriedAt: Date.now() }))
         );
@@ -317,7 +404,7 @@ function resolveAccount(req, pool) {
   let candidates = enabled.filter((account) => {
     const q = accountQuotaCache.get(account.id);
     if (!q || !q.ok) return true;
-    return q.used_pct < QUOTA_BURNT_THRESHOLD;
+    return q.used_pct < accountBurntCap(account);
   });
   if (!candidates.length) candidates = enabled;
   const strategy = process.env.GHE_ROUTING_STRATEGY || 'fill_first';
@@ -356,7 +443,7 @@ function predictRoutingTarget(pool) {
   let candidates = enabled.filter(a => {
     const q = accountQuotaCache.get(a.id);
     if (!q || !q.ok) return true;
-    return q.used_pct < QUOTA_BURNT_THRESHOLD;
+    return q.used_pct < accountBurntCap(a);
   });
   if (!candidates.length) candidates = enabled;
   const fillDir = (process.env.GHE_FILL_DIRECTION || 'desc').toLowerCase();
@@ -600,14 +687,40 @@ function poolHealth() {
     accounts: pool.accounts.map(account => {
       const session = pool.type === 'copilot' ? copilotSessionMetadata(account.id) : null;
       const premium = pool.type === 'copilot' ? premiumQuotaFromSession(session) : null;
+      const userInfo = pool.type === 'copilot' ? copilotUserInfoMetadata(account.id) : null;
+      const burntCap = accountBurntCap(account);
+      const proactiveCap = accountProactiveCap(account);
+      const hasOverride = typeof account.usedPctCap === 'number';
+      const cachedQuota = accountQuotaCache.get(account.id) || null;
       return {
         id: account.id,
+        login: userInfo?.login || null,
         disabled: !!account.disabled,
+        disabledReason: account.disabledReason || null,
+        disabledAt: account.disabledAt || null,
+        lastReEnabledAt: account.lastReEnabledAt || null,
+        lastReEnabledReason: account.lastReEnabledReason || null,
         hasToken: pool.type === 'copilot' ? !!readOauthToken(account) : !!readToken(account),
-        quota: accountQuotaCache.get(account.id) || null,
+        quota: cachedQuota,
         copilotSession: session,
+        copilotUserInfo: userInfo
+          ? {
+              login: userInfo.login,
+              copilot_plan: userInfo.copilot_plan,
+              access_type_sku: userInfo.access_type_sku,
+              organization_login_list: userInfo.organization_login_list,
+              quota_reset_date_utc: userInfo.quota_reset_date_utc,
+              quota_reset_date: userInfo.quota_reset_date,
+              quota_snapshots: userInfo.quota_snapshots || null,
+              fetchedAt: userInfo.fetchedAt,
+            }
+          : null,
         premiumQuota: premium,
         usage: getUsageSnapshot(account.id),
+        // Per-account cap surface (parity with jbai-proxy /quota.json).
+        usedPctCap: hasOverride ? account.usedPctCap : null,
+        effectiveBurntCap: burntCap,
+        effectiveProactiveCap: proactiveCap,
       };
     }),
   }));
@@ -650,6 +763,7 @@ const server = http.createServer(async (req, res) => {
         enterprise: lastEnterpriseInfo
           ? { ...lastEnterpriseInfo, refreshedAt: lastEnterpriseRefreshAt }
           : null,
+        basePath: PUBLIC_BASE_PATH,
       });
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
       return res.end(html);
@@ -665,6 +779,39 @@ const server = http.createServer(async (req, res) => {
       const r = reloadProxyConfig();
       if (r.ok) ensureQuotaRefresh({ force: true }).catch(() => {});
       return writeJson(res, r.ok ? 200 : 500, r);
+    }
+    // Manual swap-away (parity with jbai-proxy /quota/swap). Spawns
+    // ghe-swap-account.cjs against the given account id and hot-reloads.
+    if (p === '/quota/swap' && req.method === 'POST') {
+      if (!quotaAuthOK(req)) return writeJson(res, 401, { error: 'authentication required' });
+      const id = u.searchParams.get('id') || u.searchParams.get('from');
+      if (!id) return writeJson(res, 400, { ok: false, error: '?id= required' });
+      const reason = u.searchParams.get('reason') || 'manual-dashboard';
+      try {
+        await runManualOp('ghe-swap-account.cjs', ['--from', id, '--reason', reason]);
+        // Wait for the script to mutate tokens.json + then hot-reload.
+        const r = reloadProxyConfig();
+        ensureQuotaRefresh({ force: true }).catch(() => {});
+        return writeJson(res, r.ok ? 200 : 500, { ok: r.ok, swapped: id, reload: r });
+      } catch (e) {
+        return writeJson(res, 500, { ok: false, error: e.message });
+      }
+    }
+    // Manual re-enable (parity with jbai-proxy /quota/enable). Spawns
+    // ghe-unswap-account.cjs against the given account id (manual mode,
+    // ignores the disabledReason gate) and hot-reloads.
+    if (p === '/quota/enable' && req.method === 'POST') {
+      if (!quotaAuthOK(req)) return writeJson(res, 401, { error: 'authentication required' });
+      const id = u.searchParams.get('id');
+      if (!id) return writeJson(res, 400, { ok: false, error: '?id= required' });
+      try {
+        await runManualOp('ghe-unswap-account.cjs', ['--from', id]);
+        const r = reloadProxyConfig();
+        ensureQuotaRefresh({ force: true }).catch(() => {});
+        return writeJson(res, r.ok ? 200 : 500, { ok: r.ok, enabled: id, reload: r });
+      } catch (e) {
+        return writeJson(res, 500, { ok: false, error: e.message });
+      }
     }
 
     // Forwarding routes — collect body, route via pool.
