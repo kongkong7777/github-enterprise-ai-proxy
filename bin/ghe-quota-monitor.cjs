@@ -170,6 +170,7 @@ for (const pool of (tokens.pools || [])) {
 
   const cachePool = cache.pools?.[pool.id] || { tokens: {} };
   const accounts = (pool.accounts || []).filter((a) => !a.disabled);
+  const disabledAccounts = (pool.accounts || []).filter((a) => a.disabled);
   const all = (pool.accounts || []);
 
   const accountInfos = accounts.map((a) => {
@@ -181,6 +182,21 @@ for (const pool of (tokens.pools || [])) {
   const depleted = accountInfos.filter((x) => x.state === 'depleted');
   const pressured = accountInfos.filter((x) => x.state === 'pressured');
 
+  // Recovery candidates: accounts we previously auto-disabled, where
+  // the cached quota has now reset (new month, new burst budget,
+  // whatever). Without this branch, the swap path is one-way: an
+  // account disabled at end-of-month stays out of rotation forever.
+  const recoverable = [];
+  for (const a of disabledAccounts) {
+    const reasonStr = String(a.disabledReason || '');
+    if (!reasonStr.startsWith('quota-monitor:')) continue; // operator disabled — leave alone
+    const q = cachePool.tokens?.[a.id];
+    if (!q || q.ok === false) continue;                    // no fresh signal
+    if (typeof q.used_pct === 'number' && q.used_pct >= 0.5) continue; // still pressured
+    if (q.schema === 'copilot-session' && q.remaining === 0) continue; // chat still off
+    recoverable.push({ id: a.id, reason: reasonStr, used_pct: q.used_pct });
+  }
+
   summary.pools[pool.id] = {
     type: pool.type,
     enabled: accounts.length,
@@ -189,7 +205,29 @@ for (const pool of (tokens.pools || [])) {
     healthy: healthy.length,
     pressured: pressured.length,
     depleted: depleted.length,
+    disabled: disabledAccounts.length,
+    recoverable: recoverable.length,
   };
+
+  // 0. Recovery: re-enable accounts whose quota reset since they were
+  //    auto-disabled. Run this BEFORE swap so we don't disable the last
+  //    healthy account in a pool we could have refilled by recovery.
+  if (recoverable.length) {
+    summary.actions.push({ kind: 'auto-recover', poolId: pool.id, count: recoverable.length, accountIds: recoverable.map((x) => x.id) });
+    const r = runNode('ghe-unswap-account.cjs', ['--auto', '--pool', pool.id, '--reload-url', reloadUrl]);
+    notify({
+      kind: 'pool.account.recovered',
+      pool: pool.id,
+      accounts: recoverable,
+      action: 're-enabled',
+      runResult: r,
+    });
+    // After running unswap the proxy hot-reloads; subsequent depleted
+    // detection in this loop already counted using the OLD enabled
+    // set, which is still correct (we'd disable depleted accounts
+    // among the previously-enabled set; freshly-recovered accounts
+    // can't yet be in the depleted set).
+  }
 
   // 1. Disable depleted accounts (each call hot-reloads the proxy).
   for (const dep of depleted) {
@@ -258,7 +296,8 @@ if (process.argv.includes('--json')) {
   console.log(JSON.stringify({ ...summary, ts: Date.now(), tokensFile, quotaCacheFile }, null, 2));
 } else {
   for (const [pid, p] of Object.entries(summary.pools)) {
-    console.log(`pool ${pid} (${p.type}): ${p.healthy}h / ${p.pressured}p / ${p.depleted}d  (enabled ${p.enabled}/${p.total})`);
+    const recPart = p.recoverable ? ` / ${p.recoverable}r` : '';
+    console.log(`pool ${pid} (${p.type}): ${p.healthy}h / ${p.pressured}p / ${p.depleted}d${recPart}  (enabled ${p.enabled}/${p.total}, disabled ${p.disabled})`);
     for (const a of p.accounts) {
       console.log(`  ${a.id.padEnd(24)} ${a.state.padEnd(10)} ${a.reason}`);
     }

@@ -163,6 +163,14 @@ bin/ghe-quota-status
 # Disable a PAT, then poke the running proxy to hot-reload.
 bin/ghe-swap-account --from alice --reason "got a 429 spike"
 
+# Re-enable a PAT (mirror of swap-account).
+bin/ghe-unswap-account --from alice                  # one specific account
+bin/ghe-unswap-account --auto                        # quota-driven recovery:
+                                                     # flip every account that
+                                                     # was auto-disabled by
+                                                     # quota-monitor and now
+                                                     # has fresh quota
+
 # (Copilot Enterprise via EMU only — see "EMU pool members" below.)
 bin/ghe-mint-graph                              # one-time Microsoft Graph device-flow
 bin/ghe-create-emu-user --email-prefix dev2 \   # provision next pool member into Entra
@@ -225,7 +233,8 @@ node bin/ghe-mint-oauth.cjs --account dev2_carizon
 
 `bin/ghe-quota-monitor.cjs` is a cron-friendly watchdog. It reads `tokens.json` and the proxy's quota cache, classifies each enabled account as `healthy` / `pressured` / `depleted`, and:
 
-- **Depleted** (`chat_enabled` went `false`, or the rate-limit cache shows used_pct ≥ 100%) → calls `ghe-swap-account.cjs` against that account, hot-reloads the proxy.
+- **Depleted** (`chat_enabled` went `false`, or the rate-limit cache shows used_pct ≥ 100%) → calls `ghe-swap-account.cjs` against that account, hot-reloads the proxy. The swap script now also stamps `disabledReason: "quota-monitor:<reason>"` and `disabledAt` into `tokens.json` so the recovery path can tell auto-disables from manual ones.
+- **Recoverable** (account has `disabled: true` AND `disabledReason` starts with `quota-monitor:` AND its cached quota is now < 50% used) → calls `ghe-unswap-account.cjs --auto` to flip it back. This is what "an account ran out at end-of-month, new month started, quota refreshed, the proxy automatically picks it up again" means in code. Manually-disabled accounts are left alone — their `disabledReason` doesn't match the `quota-monitor:` prefix.
 - **All-depleted** (the pool just lost its last healthy account) → emits a `pool.drained` event. With `--auto-create --next-name <prefix> --next-display "<name>"` it also calls `ghe-create-emu-user.cjs` to provision the next Entra candidate so an operator only has to do the human Authorize step.
 - **Pressured** (≥ `--threshold`, default 80%) → informational only by default.
 

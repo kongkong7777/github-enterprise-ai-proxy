@@ -40,7 +40,15 @@ let edited = false;
 for (const pool of (cfg.pools || [])) {
   for (const a of (pool.accounts || [])) {
     if (a.id === fromId && !a.disabled) {
-      a.disabled = true; edited = true;
+      a.disabled = true;
+      // Record metadata so the auto-unswap path (ghe-quota-monitor) can
+      // tell "this was disabled by quota exhaustion, re-enable when fresh
+      // quota arrives" apart from "operator manually disabled this for
+      // a reason we shouldn't second-guess". Anything starting with
+      // `quota-monitor:` is treated as auto-recoverable.
+      a.disabledReason = reason;
+      a.disabledAt = Date.now();
+      edited = true;
     }
   }
 }
