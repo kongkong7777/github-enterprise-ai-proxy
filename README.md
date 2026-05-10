@@ -162,7 +162,80 @@ bin/ghe-quota-status
 
 # Disable a PAT, then poke the running proxy to hot-reload.
 bin/ghe-swap-account --from alice --reason "got a 429 spike"
+
+# (Copilot Enterprise via EMU only — see "EMU pool members" below.)
+bin/ghe-mint-graph                              # one-time Microsoft Graph device-flow
+bin/ghe-create-emu-user --email-prefix dev2 \   # provision next pool member into Entra
+                        --display-name "Dev 2" \
+                        --role User
+bin/ghe-quota-monitor --auto-create \           # cron-friendly: rotate when active
+                      --next-name dev2 \        # account is depleted, optionally
+                      --next-display "Dev 2"    # creating the next Entra candidate
 ```
+
+## EMU pool members (Copilot Enterprise via Entra ID)
+
+If your `copilot` pool is fed by an **Enterprise Managed Users** enterprise (federated to Microsoft Entra ID), adding a new pool member is fundamentally different from inviting a free GitHub account: there is no email invite, the user must come through SCIM from Entra, and the GitHub login is server-assigned (`<emailprefix>_<shortcode>`). That whole side is automated by:
+
+```
+bin/ghe-mint-graph.cjs          one-time device-flow → ~/.ghe/graph-token.json
+bin/ghe-create-emu-user.cjs     POST /users + POST /servicePrincipals/{}/appRoleAssignedTo
+                                → Entra user + role assignment, ready for SCIM to
+                                  push to GitHub at the next provisioning cycle
+bin/ghe-mint-oauth.cjs          (already existed) device-flow against the GitHub
+                                Copilot OAuth client, run by the new user once
+                                they can sign into Entra in a browser
+```
+
+End-to-end flow for adding pool member `dev2`:
+
+```bash
+# 1. (operator, once per machine) Mint a Graph token. Asks for a code to
+#    paste at https://login.microsoft.com/device. Stored at
+#    ~/.ghe/graph-token.json with refresh_token; subsequent runs of
+#    ghe-create-emu-user silently refresh.
+node bin/ghe-mint-graph.cjs
+
+# 2. (operator) Create the Entra account + assign the EMU OIDC app role.
+GHE_EMU_TENANT_ID=65685d3b-3f14-4adb-bb0b-8a9c24c52e72 \
+GHE_EMU_SP_OBJECT_ID=1ea7b560-fe1a-4a3f-9f28-45fc39c5bce6 \
+GHE_EMU_ENTERPRISE_SLUG=carizon-gh \
+node bin/ghe-create-emu-user.cjs \
+  --email-prefix dev2 --display-name "Dev 2" --role User
+
+# 3. Wait ≤40min for SCIM, or trigger on-demand provisioning in Entra.
+#    Confirm the user appeared in GitHub:
+gh api scim/v2/enterprises/carizon-gh/Users -H "Accept: application/scim+json"
+
+# 4. (the new user, in a browser) Mints their long-lived OAuth token via
+#    GitHub's Copilot device-flow.
+node bin/ghe-mint-oauth.cjs --account dev2_carizon
+
+# 5. (operator) Wire the new account into tokens.json's copilot pool and
+#    hot-reload the proxy. The mint script can do this for you with --reload.
+```
+
+### Why EMU has its own creation path
+- **No email invitations**: `/orgs/{org}/invitations` returns "managed users cannot be invited" on EMU.
+- **SCIM is the only on-ramp**: the user has to exist on the Entra side first, with a role assignment to the GitHub EMU OIDC service principal. Without the role, Entra's provisioning rejects the user with `MappingEvaluationFailed` (no app-role-assignments to evaluate) or `InvalidRoleData` (a constant string instead of an array of `{value, primary}` objects).
+- **Login suffix is fixed**: every managed user gets `<email-prefix>_<enterprise-shortcode>`. The shortcode is *not* the URL slug; check what the setup user's login looks like (e.g. `kongkong_admin` → shortcode is `kongkong`).
+- **OAuth still goes through `Iv1.b507a08c87ecfe98`** (GitHub's well-known Copilot Plugin OAuth client). The user's browser will redirect through Entra OIDC during the Authorize step — this is the only step that *requires* a real browser session.
+
+### Quota monitoring + automatic rotation
+
+`bin/ghe-quota-monitor.cjs` is a cron-friendly watchdog. It reads `tokens.json` and the proxy's quota cache, classifies each enabled account as `healthy` / `pressured` / `depleted`, and:
+
+- **Depleted** (`chat_enabled` went `false`, or the rate-limit cache shows used_pct ≥ 100%) → calls `ghe-swap-account.cjs` against that account, hot-reloads the proxy.
+- **All-depleted** (the pool just lost its last healthy account) → emits a `pool.drained` event. With `--auto-create --next-name <prefix> --next-display "<name>"` it also calls `ghe-create-emu-user.cjs` to provision the next Entra candidate so an operator only has to do the human Authorize step.
+- **Pressured** (≥ `--threshold`, default 80%) → informational only by default.
+
+Cron suggestion:
+
+```
+*/5 * * * * /home/apiadmin/github-enterprise-ai-proxy/bin/ghe-quota-monitor.cjs --auto-create --next-name dev$(date +%s) --next-display "rotation pool member" >> ~/.ghe/monitor.cron.log 2>&1
+```
+
+Plug the resulting `pool.drained` / `pool.candidate.created` events into Slack/email by setting `GHE_NOTIFY_CMD` to a shell command that reads JSON from stdin.
 
 ## systemd
 
