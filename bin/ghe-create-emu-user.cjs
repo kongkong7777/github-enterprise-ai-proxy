@@ -31,11 +31,14 @@
 //      a real browser. There is no impersonation API and no "service
 //      account" path. After SCIM creates the user, hand them off to
 //      ghe-mint-oauth.cjs for the device-flow.
-//   ✗  Assign a Copilot seat. Copilot seat assignment lives on the GitHub
-//      side (orgs/<org>/copilot/billing/selected_users); this script
-//      stays purely on the Entra+SCIM side. Once Copilot Enterprise is
-//      enabled on the enterprise, run ghe-invite-user.cjs --copilot-seat
-//      against the org the user joined.
+//
+// What this CAN do (opt-in, when the right PAT is provided):
+//   ✓  Assign a Copilot Enterprise seat. Pass --copilot-seat (or set
+//      GHE_COPILOT_ASSIGN=1) and provide GHE_COPILOT_ADMIN_PAT (PAT or
+//      fine-grained token with `manage_billing:copilot` scope on the
+//      enterprise). Requires --wait-scim so we know GitHub already
+//      provisioned the EMU login. Falls back to a clear "do this in
+//      browser" message when the PAT is missing.
 //
 // Usage:
 //   GRAPH_TOKEN=$(cat ~/.ghe/graph-token) ghe-create-emu-user.cjs \
@@ -64,6 +67,13 @@
 //                                used by --wait-scim to poll the SCIM endpoint.
 //                                Without this we skip the wait phase.
 //   GHE_EMU_ENTERPRISE_SLUG      e.g. "carizon-gh", used in the SCIM URL.
+//   GHE_COPILOT_ADMIN_PAT        PAT with `manage_billing:copilot` scope. When
+//                                set together with --copilot-seat (or
+//                                GHE_COPILOT_ASSIGN=1) this script assigns a
+//                                Copilot Enterprise seat to the new EMU user
+//                                AFTER SCIM has provisioned them. Without
+//                                this PAT the seat step is skipped and we
+//                                print the manual-assignment URL instead.
 //
 // App role IDs for the GitHub Enterprise Managed User (OIDC) gallery app
 // — these are baked into the gallery template, same in every tenant.
@@ -99,6 +109,9 @@ const wantJson       = flag('--json');
 const waitScim       = flag('--wait-scim');
 const noWait         = flag('--no-wait');
 const dryRun         = flag('--dry-run');
+const wantCopilotSeat = flag('--copilot-seat')
+  || ['1', 'true', 'yes', 'on'].includes(String(process.env.GHE_COPILOT_ASSIGN || '').toLowerCase());
+const copilotAdminPat = process.env.GHE_COPILOT_ADMIN_PAT || null;
 
 const APP_ROLES = {
   User:               '27d9891d-2c17-4f45-a262-781a0e55c80a',
@@ -108,10 +121,10 @@ const APP_ROLES = {
 };
 
 if (!emailPrefix || !displayName) {
-  console.error('Usage: ghe-create-emu-user.cjs --email-prefix <prefix> --display-name "First Last" [--role User|Enterprise Owner|Billing Manager|Guest Collaborator] [--domain kongkong.onmicrosoft.com] [--password <pwd>] [--wait-scim] [--no-wait] [--json] [--dry-run]');
+  console.error('Usage: ghe-create-emu-user.cjs --email-prefix <prefix> --display-name "First Last" [--role User|Enterprise Owner|Billing Manager|Guest Collaborator] [--domain kongkong.onmicrosoft.com] [--password <pwd>] [--wait-scim] [--no-wait] [--copilot-seat] [--json] [--dry-run]');
   console.error('');
   console.error('Required env: GRAPH_TOKEN  or  GHE_GRAPH_TOKEN_FILE pointing at the token text.');
-  console.error('Optional env: GHE_EMU_SP_OBJECT_ID, GHE_EMU_DOMAIN, GHE_EMU_ENTERPRISE_SLUG, GHE_EMU_GITHUB_PAT');
+  console.error('Optional env: GHE_EMU_SP_OBJECT_ID, GHE_EMU_DOMAIN, GHE_EMU_ENTERPRISE_SLUG, GHE_EMU_GITHUB_PAT, GHE_COPILOT_ADMIN_PAT (for --copilot-seat)');
   process.exit(2);
 }
 if (!APP_ROLES[role]) {
@@ -252,6 +265,55 @@ function genPassword() {
   return out.split('').sort(() => 0.5 - Math.random()).join('');
 }
 
+// ─── Copilot Enterprise seat assignment ──────────────────────────────────
+//
+// EMU enterprises with Copilot Enterprise billing manage seats at the
+// enterprise level (centralized), not per-org. The endpoint is:
+//
+//   POST /enterprises/{enterprise}/copilot/billing/selected_users
+//   { "selected_usernames": ["alice_carizon-gh"] }
+//
+// Returns { seats_created: N }. Requires `manage_billing:copilot` scope on
+// the PAT — a `ghu_` OAuth token cannot do this even if the user is an
+// Enterprise Owner; you need a real PAT (classic) or fine-grained PAT
+// granted at the enterprise level.
+async function assignCopilotEnterpriseSeat(login) {
+  if (!copilotAdminPat) {
+    return {
+      assigned: false,
+      reason: 'GHE_COPILOT_ADMIN_PAT not set',
+      manualUrl: `https://github.com/enterprises/${enterpriseSlug}/copilot/seats`,
+    };
+  }
+  const url = `https://api.github.com/enterprises/${encodeURIComponent(enterpriseSlug)}/copilot/billing/selected_users`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${copilotAdminPat}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'Content-Type': 'application/json',
+      'User-Agent': 'ghe-create-emu-user.cjs',
+    },
+    body: JSON.stringify({ selected_usernames: [login] }),
+  });
+  const text = await res.text();
+  let json = null; try { json = text ? JSON.parse(text) : null; } catch {}
+  if (res.status === 201 || res.status === 200) {
+    return { assigned: true, response: json, status: res.status };
+  }
+  // 422 with "already assigned" should be treated as a benign idempotent success.
+  if (res.status === 422 && /already.*assigned|already has a Copilot subscription/i.test(text)) {
+    return { assigned: true, response: json, status: res.status, note: 'already had a seat' };
+  }
+  return {
+    assigned: false,
+    reason: `HTTP ${res.status}: ${json?.message || text.slice(0, 200)}`,
+    status: res.status,
+    manualUrl: `https://github.com/enterprises/${enterpriseSlug}/copilot/seats`,
+  };
+}
+
 // ─── SCIM poll ───────────────────────────────────────────────────────────
 
 async function waitForScimUser(targetExternalId, deadlineMs) {
@@ -361,6 +423,25 @@ async function waitForScimUser(targetExternalId, deadlineMs) {
     }
   }
 
+  // 4. Optional Copilot Enterprise seat assignment. Only runs if SCIM
+  //    confirmed the user landed on GitHub (so we know the login). Skipped
+  //    silently if the operator didn't ask for it; falls back to a manual
+  //    URL when the admin PAT isn't available.
+  let copilotSeat = null;
+  if (wantCopilotSeat) {
+    const githubLogin = scimUser?.userName || expectedGithubLogin;
+    if (!scimUser) {
+      console.warn(`[copilot] SCIM hadn't returned a user yet; assigning seat to best-guess login "${githubLogin}". Re-run with --wait-scim if it fails.`);
+    }
+    copilotSeat = await assignCopilotEnterpriseSeat(githubLogin);
+    if (copilotSeat.assigned) {
+      console.log(`[copilot] ✓ Copilot Enterprise seat assigned to ${githubLogin}` + (copilotSeat.note ? ` (${copilotSeat.note})` : ''));
+    } else {
+      console.warn(`[copilot] seat NOT assigned: ${copilotSeat.reason}`);
+      console.warn(`[copilot] manual: ${copilotSeat.manualUrl}`);
+    }
+  }
+
   // ─── output ──────────────────────────────────────────────────────────
 
   const result = {
@@ -380,10 +461,16 @@ async function waitForScimUser(targetExternalId, deadlineMs) {
       `1. Have the user sign in once at https://login.microsoftonline.com with ${user.userPrincipalName} (they will be forced to change the password).`,
       `2. Wait for SCIM provisioning to push them to GitHub (auto, ≤40min) or trigger on-demand provisioning in Entra.`,
       `3. Their GitHub login will be ${expectedGithubLogin} (managed user shortcode is the trailing part).`,
-      `4. Hand them off to ghe-mint-oauth.cjs --account ${expectedGithubLogin} to capture a long-lived Copilot OAuth token (they have to click Authorize in a browser; cannot be automated).`,
-      `5. Add their entry to tokens.json under the copilot pool (oauthTokenFile: "~/.ghe/${expectedGithubLogin}.oauth"), then POST /quota/reload on the proxy.`,
+      copilotSeat?.assigned
+        ? `4. Copilot Enterprise seat ALREADY assigned ✓ — proceed straight to ghe-mint-oauth.cjs --account ${expectedGithubLogin}.`
+        : (wantCopilotSeat
+          ? `4. Copilot seat assignment FAILED (${copilotSeat?.reason || 'unknown'}). Manual: ${copilotSeat?.manualUrl || `https://github.com/enterprises/${enterpriseSlug}/copilot/seats`}. Then run ghe-mint-oauth.cjs --account ${expectedGithubLogin}.`
+          : `4. Assign a Copilot Enterprise seat — either re-run with --copilot-seat (after exporting GHE_COPILOT_ADMIN_PAT) or use the UI at https://github.com/enterprises/${enterpriseSlug}/copilot/seats. Then ghe-mint-oauth.cjs --account ${expectedGithubLogin}.`),
+      `5. Run ghe-mint-oauth.cjs --account ${expectedGithubLogin} to capture a long-lived Copilot OAuth token (browser device-flow; no automation possible — Authorize click is mandatory).`,
+      `6. Add their entry to tokens.json under the copilot pool (oauthTokenFile: "~/.ghe/${expectedGithubLogin}.oauth"), then POST /quota/reload on the proxy.`,
     ],
   };
+  if (copilotSeat) result.copilotSeat = copilotSeat;
 
   if (scimUser) {
     result.scim = {
@@ -407,6 +494,12 @@ async function waitForScimUser(targetExternalId, deadlineMs) {
     console.log(`  → expected GitHub login: ${expectedGithubLogin}`);
     console.log(`  → initial password (one-time): ${password}`);
     console.log(`  → tell the user to log in at https://login.microsoftonline.com once to change it.`);
+    if (copilotSeat?.assigned) {
+      console.log(`  → Copilot Enterprise seat: ASSIGNED ✓`);
+    } else if (wantCopilotSeat) {
+      console.log(`  → Copilot Enterprise seat: NOT ASSIGNED — ${copilotSeat?.reason || 'unknown'}`);
+      console.log(`     manual: ${copilotSeat?.manualUrl || `https://github.com/enterprises/${enterpriseSlug}/copilot/seats`}`);
+    }
     console.log(`  → next: wait for SCIM (≤40min) then run`);
     console.log(`         ghe-mint-oauth.cjs --account ${expectedGithubLogin}`);
   }

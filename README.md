@@ -229,6 +229,54 @@ node bin/ghe-mint-oauth.cjs --account dev2_carizon
 - **Login suffix is fixed**: every managed user gets `<email-prefix>_<enterprise-shortcode>`. The shortcode is *not* the URL slug; check what the setup user's login looks like (e.g. `kongkong_admin` → shortcode is `kongkong`).
 - **OAuth still goes through `Iv1.b507a08c87ecfe98`** (GitHub's well-known Copilot Plugin OAuth client). The user's browser will redirect through Entra OIDC during the Authorize step — this is the only step that *requires* a real browser session.
 
+### Copilot 席位（license）自动分配 — 需要一个高权限 PAT
+
+`ghe-create-emu-user.cjs` 默认只把账号建到 Entra + 通过 SCIM 推到 GitHub，**不**自动给新账号分配 Copilot Enterprise 席位 — 因为席位 API 要 `manage_billing:copilot` scope，而 `ghe-mint-oauth.cjs` 拿到的 `ghu_` OAuth token 拿不到这个 scope（即便用户是 Enterprise Owner 也不行，OAuth App 不暴露 billing scope）。
+
+启用席位自动分配只需要一次性动作：
+
+```bash
+# 1. 浏览器打开（必须用一个能登录企业的 GitHub 账号 — 通常就是 kongkong7777）
+#    https://github.com/settings/tokens/new?scopes=manage_billing:copilot,read:enterprise,read:org&description=ghe-create-emu-user
+#    勾上面三个 scope，create token，复制 ghp_… 字符串。
+
+# 2. 写到 ~/.ghe/admin-pat 或者直接 export
+export GHE_COPILOT_ADMIN_PAT=ghp_…
+
+# 3. 之后所有 ghe-create-emu-user 都自动分配席位
+GHE_COPILOT_ADMIN_PAT=$(cat ~/.ghe/admin-pat) \
+GHE_EMU_ENTERPRISE_SLUG=carizon-gh \
+node bin/ghe-create-emu-user.cjs \
+  --email-prefix dev3 --display-name "Dev 3" --role User \
+  --wait-scim --copilot-seat
+```
+
+`--copilot-seat`（或 env `GHE_COPILOT_ASSIGN=1`）会在 SCIM 把用户推到 GitHub 之后，立即调用 `POST /enterprises/{enterprise}/copilot/billing/selected_users` 把席位绑过去。失败会给出 manual UI URL 兜底。
+
+### Copilot 席位用量监控 — `ghe-license-status.cjs`
+
+读取 enterprise-level Copilot billing，回答"我们买了几个席位、用了几个、谁在用"。同样需要 `GHE_COPILOT_ADMIN_PAT`。
+
+```bash
+# 文本输出（推荐 cron 用）
+GHE_COPILOT_ADMIN_PAT=$(cat ~/.ghe/admin-pat) \
+GHE_EMU_ENTERPRISE_SLUG=carizon-gh \
+node bin/ghe-license-status.cjs
+# enterprise: carizon-gh
+# seats:      3/5 used  (2 free, 0 pending, 0 pending cancellation, +0 this cycle)
+# mode:       assign_selected
+# policy:     public_suggestions=allow, ide_chat=enabled, …
+
+# 详细每个席位最近活动 / editor
+GHE_COPILOT_ADMIN_PAT=$(cat ~/.ghe/admin-pat) \
+node bin/ghe-license-status.cjs --seats
+
+# 给 Slack/jq 用的 JSON
+node bin/ghe-license-status.cjs --json | jq '.seats[] | select(.last_activity_at < "2026-04")'
+```
+
+席位信息也会在 proxy 进程启动后自动 5 分钟刷新一次，写到 `/quota.json` 的 `enterprise` 字段，并以一条横幅渲染在 `/quota` HTML dashboard 顶部（类似 "3/5 已用 · 2 可用 · 0 待激活"）。proxy 端只需要 export `GHE_COPILOT_ADMIN_PAT` 进它的 systemd `EnvironmentFile=`。
+
 ### Quota monitoring + automatic rotation
 
 `bin/ghe-quota-monitor.cjs` is a cron-friendly watchdog. It reads `tokens.json` and the proxy's quota cache, classifies each enabled account as `healthy` / `pressured` / `depleted`, and:

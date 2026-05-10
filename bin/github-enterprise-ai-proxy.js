@@ -49,6 +49,15 @@ const QUOTA_BURNT_THRESHOLD = parseFloat(process.env.GHE_QUOTA_BURNT_THRESHOLD |
 const ROUTING_HYSTERESIS = parseFloat(process.env.GHE_ROUTING_HYSTERESIS || '0.01');
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.GHE_UPSTREAM_TIMEOUT_MS || String(10 * 60 * 1000), 10);
 
+// Enterprise-level Copilot license probe. Optional — enabled when
+// GHE_COPILOT_ADMIN_PAT is set. Surfaces "X seats / Y total" on /quota.json
+// so operators don't have to log into the GitHub UI to know seat usage.
+// Refreshed on the same cadence as the per-account session probe.
+const ENTERPRISE_SLUG = process.env.GHE_EMU_ENTERPRISE_SLUG || 'carizon-gh';
+const COPILOT_ADMIN_PAT = process.env.GHE_COPILOT_ADMIN_PAT || '';
+let lastEnterpriseRefreshAt = 0;
+let lastEnterpriseInfo = null;     // null = never queried; { ok: true, … } | { ok: false, error }
+
 // Routing targets — the path prefix → upstream mapping.
 const UPSTREAMS = {
   '/v1/chat/completions':   { host: 'models.github.ai',         path: '/inference/chat/completions' },
@@ -218,7 +227,77 @@ async function refreshAllQuotas() {
     }
   }
   writeQuotaCache(cache);
+  // Enterprise license probe (best-effort, never blocks the per-account flow).
+  refreshEnterpriseLicense().catch((e) =>
+    console.warn(`[license] enterprise probe failed: ${e.message}`));
   return [...accountQuotaCache.values()].filter(q => q?.ok).length;
+}
+
+// Enterprise-level Copilot seat probe. Best-effort: failures are cached
+// (so /quota.json shows the actual error) but don't break per-account
+// quota refresh. Skipped entirely when GHE_COPILOT_ADMIN_PAT is unset —
+// the dashboard then renders a "set GHE_COPILOT_ADMIN_PAT to see seats"
+// hint instead of a misleading "0 seats".
+async function refreshEnterpriseLicense() {
+  if (!COPILOT_ADMIN_PAT) {
+    lastEnterpriseInfo = { ok: false, error: 'GHE_COPILOT_ADMIN_PAT not set', notConfigured: true };
+    lastEnterpriseRefreshAt = Date.now();
+    return lastEnterpriseInfo;
+  }
+  const url = `https://api.github.com/enterprises/${encodeURIComponent(ENTERPRISE_SLUG)}/copilot/billing`;
+  let res, text;
+  try {
+    res = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${COPILOT_ADMIN_PAT}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'github-enterprise-ai-proxy',
+      },
+    });
+    text = await res.text();
+  } catch (e) {
+    lastEnterpriseInfo = { ok: false, error: `network: ${e.message}` };
+    lastEnterpriseRefreshAt = Date.now();
+    return lastEnterpriseInfo;
+  }
+  let json = null; try { json = text ? JSON.parse(text) : null; } catch {}
+  if (!res.ok) {
+    lastEnterpriseInfo = {
+      ok: false,
+      status: res.status,
+      error: json?.message || text.slice(0, 200),
+      hint: res.status === 404
+        ? 'either Copilot Enterprise is not enabled, or the PAT lacks manage_billing:copilot scope'
+        : (res.status === 401 || res.status === 403 ? 'PAT rejected (check manage_billing:copilot scope)' : null),
+    };
+    lastEnterpriseRefreshAt = Date.now();
+    return lastEnterpriseInfo;
+  }
+  const sb = json?.seat_breakdown || {};
+  lastEnterpriseInfo = {
+    ok: true,
+    enterprise: ENTERPRISE_SLUG,
+    seats: {
+      total: sb.total ?? null,
+      active_this_cycle: sb.active_this_cycle ?? null,
+      pending_invitation: sb.pending_invitation ?? 0,
+      pending_cancellation: sb.pending_cancellation ?? 0,
+      added_this_cycle: sb.added_this_cycle ?? 0,
+      // Convenience field: best-effort "free" seat count. May be off when
+      // pending_cancellation has not yet zeroed out.
+      free: (typeof sb.total === 'number' && typeof sb.active_this_cycle === 'number')
+        ? Math.max(0, sb.total - sb.active_this_cycle - (sb.pending_invitation || 0))
+        : null,
+    },
+    seat_management_setting: json.seat_management_setting,
+    public_code_suggestions: json.public_code_suggestions,
+    ide_chat: json.ide_chat,
+    platform_chat: json.platform_chat,
+    cli: json.cli,
+  };
+  lastEnterpriseRefreshAt = Date.now();
+  return lastEnterpriseInfo;
 }
 
 async function ensureQuotaRefresh({ force = false } = {}) {
@@ -541,17 +620,37 @@ const server = http.createServer(async (req, res) => {
     const p = u.pathname;
 
     // Health & dashboard routes
-    if (p === '/health') return writeJson(res, 200, { ok: true, pools: poolHealth(), updatedAt: lastQuotaRefreshAt });
+    if (p === '/health') return writeJson(res, 200, {
+      ok: true,
+      pools: poolHealth(),
+      updatedAt: lastQuotaRefreshAt,
+      enterprise: lastEnterpriseInfo
+        ? { ...lastEnterpriseInfo, refreshedAt: lastEnterpriseRefreshAt }
+        : null,
+    });
     if (p === '/quota.json') {
       if (!quotaAuthOK(req)) return writeJson(res, 401, { error: 'authentication required' });
-      return writeJson(res, 200, { service: 'github-enterprise-ai-proxy', updatedAt: lastQuotaRefreshAt, pools: poolHealth() });
+      return writeJson(res, 200, {
+        service: 'github-enterprise-ai-proxy',
+        updatedAt: lastQuotaRefreshAt,
+        pools: poolHealth(),
+        enterprise: lastEnterpriseInfo
+          ? { ...lastEnterpriseInfo, refreshedAt: lastEnterpriseRefreshAt }
+          : null,
+      });
     }
     if (p === '/quota') {
       if (!quotaAuthOK(req)) {
         res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="ghe-quota"' });
         return res.end('authentication required');
       }
-      const html = renderQuotaDashboard({ pools: poolHealth(), updatedAt: lastQuotaRefreshAt });
+      const html = renderQuotaDashboard({
+        pools: poolHealth(),
+        updatedAt: lastQuotaRefreshAt,
+        enterprise: lastEnterpriseInfo
+          ? { ...lastEnterpriseInfo, refreshedAt: lastEnterpriseRefreshAt }
+          : null,
+      });
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
       return res.end(html);
     }
