@@ -38,8 +38,19 @@ const noReload  = flag('--no-reload');
 const reloadUrl = arg('--reload-url') || process.env.GHE_RELOAD_URL || 'http://127.0.0.1:18081/quota/reload';
 const outDir    = process.env.GHE_OAUTH_DIR || path.join(os.homedir(), '.ghe');
 
+// Pool-management flags (added 2026-05-11).
+// addToPool defaults ON because after the device-flow the operator almost
+// always wants the new token to be live in the pool — having to manually
+// edit tokens.json is the exact friction this script exists to eliminate.
+// Pass --no-add-to-pool to keep the legacy "write file only" behavior.
+const addToPool = !flag('--no-add-to-pool');
+const poolId    = arg('--pool-id') || 'copilot';
+const tokensFile = arg('--tokens-file')
+  || process.env.GHE_TOKENS_FILE
+  || path.resolve(__dirname, '..', 'tokens.json');
+
 if (!accountId) {
-  console.error('Usage: ghe-mint-oauth.cjs --account <id> [--client-id <oauth-app-id>] [--no-reload]');
+  console.error('Usage: ghe-mint-oauth.cjs --account <id> [--client-id <oauth-app-id>] [--no-reload] [--no-add-to-pool] [--pool-id <id>] [--tokens-file <path>]');
   process.exit(2);
 }
 
@@ -90,6 +101,53 @@ function getJson(host, urlPath, headers = {}) {
   });
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Insert (or refresh) the account into tokens.json's named pool.
+// Idempotent: existing account with same id is updated (path + clear disabled).
+// Throws if tokens.json is missing or unparseable so the caller can decide
+// whether to fail the device-flow result.
+function upsertIntoTokensJson({ tokensFile, poolId, accountId, oauthTokenFile }) {
+  if (!fs.existsSync(tokensFile)) {
+    throw new Error(`tokens.json not found at ${tokensFile} — use --tokens-file or GHE_TOKENS_FILE`);
+  }
+  const raw = fs.readFileSync(tokensFile, 'utf8');
+  const cfg = JSON.parse(raw);
+  if (!Array.isArray(cfg.pools)) cfg.pools = [];
+  const pool = cfg.pools.find(p => p.id === poolId);
+  if (!pool) {
+    throw new Error(`pool '${poolId}' not in tokens.json. Available: [${cfg.pools.map(p=>p.id).join(', ')}]`);
+  }
+  if (!Array.isArray(pool.accounts)) pool.accounts = [];
+  const existing = pool.accounts.find(a => a.id === accountId);
+  let action;
+  if (existing) {
+    // Refresh: update path, clear disabled, clear quota-monitor bookkeeping
+    // so it gets re-evaluated on the next sweep.
+    existing.oauthTokenFile = oauthTokenFile;
+    delete existing.token;
+    delete existing.oauthToken;
+    delete existing.tokenFile;
+    existing.disabled = false;
+    delete existing.disabledReason;
+    delete existing.disabledAt;
+    existing.lastReEnabledAt = Date.now();
+    existing.lastReEnabledReason = 'mint-oauth:re-mint';
+    action = 'updated';
+  } else {
+    pool.accounts.push({
+      id: accountId,
+      oauthTokenFile,
+      disabled: false,
+    });
+    action = 'added';
+  }
+  // Atomic write via tmp + rename.
+  const tmp = tokensFile + '.tmp.' + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 });
+  fs.renameSync(tmp, tokensFile);
+  return { action, poolId, accountCount: pool.accounts.length };
+}
+
 
 (async () => {
   // 1. Request device code.
@@ -157,6 +215,27 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const outPath = path.join(outDir, `${accountId}.oauth`);
   fs.writeFileSync(outPath, token, { mode: 0o600 });
   console.log(`[mint] wrote ${outPath}`);
+
+  // 4b. Register the account in tokens.json (idempotent). Skipped with
+  //     --no-add-to-pool. Failure here is non-fatal — the token file is
+  //     already on disk so the operator can manually fix tokens.json.
+  if (addToPool) {
+    try {
+      // Persist a TILDE-form path so tokens.json stays portable across hosts
+      // (the proxy expandHome()'s anything starting with ~/).
+      const homeDir = os.homedir();
+      const oauthPathForConfig = outPath.startsWith(homeDir + path.sep)
+        ? '~' + outPath.slice(homeDir.length)
+        : outPath;
+      const r = upsertIntoTokensJson({ tokensFile, poolId, accountId, oauthTokenFile: oauthPathForConfig });
+      console.log(`[mint] tokens.json ${r.action} ${accountId} in pool '${r.poolId}' (pool now has ${r.accountCount} account(s))`);
+    } catch (e) {
+      console.warn(`[mint] WARNING: tokens.json update failed (token file is still on disk): ${e.message}`);
+      console.warn(`[mint] manually add to ${tokensFile} under pool '${poolId}': { "id": "${accountId}", "oauthTokenFile": "~/.ghe/${accountId}.oauth" }`);
+    }
+  } else {
+    console.log(`[mint] --no-add-to-pool; not touching tokens.json. Add manually + POST /quota/reload.`);
+  }
 
   // 5. Hot-reload proxy.
   if (noReload) {
