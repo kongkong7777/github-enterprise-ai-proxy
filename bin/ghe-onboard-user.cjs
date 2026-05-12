@@ -144,7 +144,12 @@ function prompt(question) {
 
   const upn = result?.entra?.userPrincipalName;
   const initialPassword = result?.initialPassword;
-  const githubLogin = result?.scim?.userName || result?.enterprise?.expectedGithubLogin;
+  // Prefer the GraphQL-resolved EnterpriseUserAccount.login (e.g. `dev2_kongkong`)
+  // over the SCIM userName (`dev2@baidu.ooo`) — the OAuth device-flow + the
+  // proxy pool both want the actual login, not the email.
+  const githubLogin = result?.enterprise?.resolvedGithubLogin
+    || result?.scim?.userName
+    || result?.enterprise?.expectedGithubLogin;
   if (!githubLogin) {
     console.error('[onboard] could not determine GitHub login from create-emu-user output');
     process.exit(12);

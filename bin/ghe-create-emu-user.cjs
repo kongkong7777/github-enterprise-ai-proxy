@@ -112,6 +112,13 @@ const dryRun         = flag('--dry-run');
 const wantCopilotSeat = flag('--copilot-seat')
   || ['1', 'true', 'yes', 'on'].includes(String(process.env.GHE_COPILOT_ASSIGN || '').toLowerCase());
 const copilotAdminPat = process.env.GHE_COPILOT_ADMIN_PAT || null;
+// Optional enterprise-team auto-add. When set, the new user is added to
+// this team after SCIM provisioning succeeds; the team's organization
+// membership policy (typically `organization_selection_type: "all"`) plus
+// the receiving org's Copilot Enterprise allowlist auto-grants the user
+// a $39/1000 Enterprise seat — no /selected_users API call needed, no
+// org-membership prerequisite (the team add IS the membership add).
+const enterpriseTeamId = arg('--enterprise-team-id') || process.env.GHE_EMU_ENTERPRISE_TEAM_ID || null;
 
 const APP_ROLES = {
   User:               '27d9891d-2c17-4f45-a262-781a0e55c80a',
@@ -475,22 +482,108 @@ async function waitForScimUser(targetExternalId, deadlineMs) {
     }
   }
 
-  // 4. Optional Copilot Enterprise seat assignment. Only runs if SCIM
+  // 3b. SCIM userName is an email address (e.g. `dev2@baidu.ooo`) but
+  //     /selected_users and /teams/{id}/memberships both want the actual
+  //     EnterpriseUserAccount login (e.g. `dev2_kongkong`). They don't
+  //     follow a deterministic rule — GitHub picks the shortcode based
+  //     on the enterprise's display name. Resolve it via GraphQL.
+  let resolvedGithubLogin = null;
+  if (scimUser?.userName && githubPat) {
+    try {
+      const r = await fetch('https://api.github.com/graphql', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${githubPat}`,
+          'Content-Type': 'application/json',
+          'User-Agent': 'ghe-create-emu-user.cjs',
+        },
+        body: JSON.stringify({
+          query: `query($slug:String!,$q:String!){enterprise(slug:$slug){members(query:$q,first:5){nodes{__typename ... on EnterpriseUserAccount{login}}}}}`,
+          variables: { slug: enterpriseSlug, q: emailPrefix },
+        }),
+      });
+      const j = await r.json();
+      const nodes = j?.data?.enterprise?.members?.nodes || [];
+      // Match by mailNickname prefix (`dev2`) in the login (`dev2_kongkong`).
+      const hit = nodes.find(n => n.login && n.login.toLowerCase().startsWith(emailPrefix.toLowerCase() + '_'))
+                || nodes.find(n => n.login === emailPrefix);
+      if (hit) {
+        resolvedGithubLogin = hit.login;
+        console.log(`[login] resolved GitHub login: ${resolvedGithubLogin}`);
+      } else {
+        console.warn(`[login] could not resolve GitHub login via GraphQL for "${emailPrefix}". Falling back to "${expectedGithubLogin}".`);
+      }
+    } catch (e) {
+      console.warn(`[login] GraphQL lookup failed: ${e.message}`);
+    }
+  }
+
+  // 3c. Add to enterprise team (auto-grants Copilot Enterprise seat via the
+  //     team's "all orgs" policy + carizon-dev's Selected-members allowlist
+  //     including the team). This is the canonical EMU onboarding step —
+  //     org membership and Copilot seat both fall out of team membership.
+  //     Skipped if no team id configured.
+  let teamMembership = null;
+  if (enterpriseTeamId && resolvedGithubLogin && githubPat) {
+    try {
+      const r = await fetch(
+        `https://api.github.com/enterprises/${encodeURIComponent(enterpriseSlug)}/teams/${enterpriseTeamId}/memberships/${encodeURIComponent(resolvedGithubLogin)}`,
+        {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${githubPat}`,
+            Accept: 'application/vnd.github+json',
+            'Content-Type': 'application/json',
+            'X-GitHub-Api-Version': '2022-11-28',
+            'User-Agent': 'ghe-create-emu-user.cjs',
+          },
+          body: '{}',
+        }
+      );
+      const text = await r.text();
+      if (r.ok) {
+        teamMembership = { added: true, teamId: Number(enterpriseTeamId), login: resolvedGithubLogin };
+        console.log(`[team]  ✓ added ${resolvedGithubLogin} to enterprise team ${enterpriseTeamId} (this triggers Enterprise-tier Copilot seat via the org's team allowlist)`);
+      } else {
+        teamMembership = { added: false, reason: `HTTP ${r.status}: ${text.slice(0, 200)}` };
+        console.warn(`[team]  failed to add ${resolvedGithubLogin} to team ${enterpriseTeamId}: ${teamMembership.reason}`);
+      }
+    } catch (e) {
+      teamMembership = { added: false, reason: `network: ${e.message}` };
+      console.warn(`[team]  network error adding to team: ${e.message}`);
+    }
+  } else if (enterpriseTeamId && !resolvedGithubLogin) {
+    console.warn(`[team]  GHE_EMU_ENTERPRISE_TEAM_ID is set but we couldn't resolve the GitHub login — skipping team add.`);
+  }
+
+  // 4. Optional Copilot Enterprise seat assignment. Now mostly redundant
+  //    when GHE_EMU_ENTERPRISE_TEAM_ID is set (team-add already triggered
+  //    the seat), but kept as belt-and-suspenders. Only runs if SCIM
   //    confirmed the user landed on GitHub (so we know the login). Skipped
   //    silently if the operator didn't ask for it; falls back to a manual
   //    URL when the admin PAT isn't available.
   let copilotSeat = null;
   if (wantCopilotSeat) {
-    const githubLogin = scimUser?.userName || expectedGithubLogin;
-    if (!scimUser) {
-      console.warn(`[copilot] SCIM hadn't returned a user yet; assigning seat to best-guess login "${githubLogin}". Re-run with --wait-scim if it fails.`);
-    }
-    copilotSeat = await assignCopilotEnterpriseSeat(githubLogin);
-    if (copilotSeat.assigned) {
-      console.log(`[copilot] ✓ Copilot Enterprise seat assigned to ${githubLogin}` + (copilotSeat.note ? ` (${copilotSeat.note})` : ''));
+    if (teamMembership?.added) {
+      copilotSeat = {
+        assigned: true,
+        tier: 'enterprise',
+        note: `auto-granted via enterprise team ${enterpriseTeamId} (no explicit /selected_users call needed)`,
+        viaTeam: true,
+      };
+      console.log(`[copilot] ✓ Copilot Enterprise seat auto-granted via team membership; skipping explicit /selected_users call`);
     } else {
-      console.warn(`[copilot] seat NOT assigned: ${copilotSeat.reason}`);
-      console.warn(`[copilot] manual: ${copilotSeat.manualUrl}`);
+      const githubLogin = resolvedGithubLogin || scimUser?.userName || expectedGithubLogin;
+      if (!scimUser) {
+        console.warn(`[copilot] SCIM hadn't returned a user yet; assigning seat to best-guess login "${githubLogin}". Re-run with --wait-scim if it fails.`);
+      }
+      copilotSeat = await assignCopilotEnterpriseSeat(githubLogin);
+      if (copilotSeat.assigned) {
+        console.log(`[copilot] ✓ Copilot seat assigned to ${githubLogin} (tier=${copilotSeat.tier || 'unknown'})` + (copilotSeat.note ? ` (${copilotSeat.note})` : ''));
+      } else {
+        console.warn(`[copilot] seat NOT assigned: ${copilotSeat.reason}`);
+        console.warn(`[copilot] manual: ${copilotSeat.manualUrl}`);
+      }
     }
   }
 
@@ -507,19 +600,24 @@ async function waitForScimUser(targetExternalId, deadlineMs) {
       forceChangePasswordOnFirstSignIn: true,
     },
     appRole: { name: role, id: APP_ROLES[role], spObjectId },
-    enterprise: { slug: enterpriseSlug, expectedGithubLogin },
+    enterprise: {
+      slug: enterpriseSlug,
+      expectedGithubLogin,
+      resolvedGithubLogin,
+      teamMembership,
+    },
     initialPassword: password, // print once; nowhere is this kept
     nextSteps: [
       `1. Have the user sign in once at https://login.microsoftonline.com with ${user.userPrincipalName} (they will be forced to change the password).`,
       `2. Wait for SCIM provisioning to push them to GitHub (auto, ≤40min) or trigger on-demand provisioning in Entra.`,
-      `3. Their GitHub login will be ${expectedGithubLogin} (managed user shortcode is the trailing part).`,
+      `3. Their GitHub login is ${resolvedGithubLogin || expectedGithubLogin}${resolvedGithubLogin ? ' (resolved via GraphQL)' : ` (best guess — confirm via GraphQL members(query:"${emailPrefix}"))`}.`,
       copilotSeat?.assigned
-        ? `4. Copilot Enterprise seat ALREADY assigned ✓ — proceed straight to ghe-mint-oauth.cjs --account ${expectedGithubLogin}.`
+        ? `4. Copilot Enterprise seat ALREADY assigned ✓ — proceed straight to ghe-mint-oauth.cjs --account ${resolvedGithubLogin || expectedGithubLogin}.`
         : (wantCopilotSeat
-          ? `4. Copilot seat assignment FAILED (${copilotSeat?.reason || 'unknown'}). Manual: ${copilotSeat?.manualUrl || `https://github.com/enterprises/${enterpriseSlug}/copilot/seats`}. Then run ghe-mint-oauth.cjs --account ${expectedGithubLogin}.`
-          : `4. Assign a Copilot Enterprise seat — either re-run with --copilot-seat (after exporting GHE_COPILOT_ADMIN_PAT) or use the UI at https://github.com/enterprises/${enterpriseSlug}/copilot/seats. Then ghe-mint-oauth.cjs --account ${expectedGithubLogin}.`),
-      `5. Run ghe-mint-oauth.cjs --account ${expectedGithubLogin} to capture a long-lived Copilot OAuth token (browser device-flow; no automation possible — Authorize click is mandatory).`,
-      `6. Add their entry to tokens.json under the copilot pool (oauthTokenFile: "~/.ghe/${expectedGithubLogin}.oauth"), then POST /quota/reload on the proxy.`,
+          ? `4. Copilot seat assignment FAILED (${copilotSeat?.reason || 'unknown'}). Manual: ${copilotSeat?.manualUrl || `https://github.com/enterprises/${enterpriseSlug}/copilot/seats`}. Then run ghe-mint-oauth.cjs --account ${resolvedGithubLogin || expectedGithubLogin}.`
+          : `4. Assign a Copilot Enterprise seat — either re-run with --copilot-seat (after exporting GHE_COPILOT_ADMIN_PAT) or use the UI at https://github.com/enterprises/${enterpriseSlug}/copilot/seats. Then ghe-mint-oauth.cjs --account ${resolvedGithubLogin || expectedGithubLogin}.`),
+      `5. Run ghe-mint-oauth.cjs --account ${resolvedGithubLogin || expectedGithubLogin} to capture a long-lived Copilot OAuth token (browser device-flow; no automation possible — Authorize click is mandatory).`,
+      `6. Add their entry to tokens.json under the copilot pool (oauthTokenFile: "~/.ghe/${resolvedGithubLogin || expectedGithubLogin}.oauth"), then POST /quota/reload on the proxy.`,
     ],
   };
   if (copilotSeat) result.copilotSeat = copilotSeat;
@@ -553,7 +651,7 @@ async function waitForScimUser(targetExternalId, deadlineMs) {
       console.log(`     manual: ${copilotSeat?.manualUrl || `https://github.com/enterprises/${enterpriseSlug}/copilot/seats`}`);
     }
     console.log(`  → next: wait for SCIM (≤40min) then run`);
-    console.log(`         ghe-mint-oauth.cjs --account ${expectedGithubLogin}`);
+    console.log(`         ghe-mint-oauth.cjs --account ${resolvedGithubLogin || expectedGithubLogin}`);
   }
 })().catch((e) => {
   console.error('[ghe-create-emu-user] error:', e.message);
