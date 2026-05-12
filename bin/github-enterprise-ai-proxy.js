@@ -388,17 +388,16 @@ async function refreshEnterpriseLicense() {
     lastEnterpriseRefreshAt = Date.now();
     return lastEnterpriseInfo;
   }
-  const url = `https://api.github.com/enterprises/${encodeURIComponent(ENTERPRISE_SLUG)}/copilot/billing`;
+  const ghHeaders = {
+    Authorization: `Bearer ${COPILOT_ADMIN_PAT}`,
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'User-Agent': 'github-enterprise-ai-proxy',
+  };
+  const billingUrl = `https://api.github.com/enterprises/${encodeURIComponent(ENTERPRISE_SLUG)}/copilot/billing`;
   let res, text;
   try {
-    res = await fetch(url, {
-      headers: {
-        Authorization: `Bearer ${COPILOT_ADMIN_PAT}`,
-        Accept: 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'github-enterprise-ai-proxy',
-      },
-    });
+    res = await fetch(billingUrl, { headers: ghHeaders });
     text = await res.text();
   } catch (e) {
     lastEnterpriseInfo = { ok: false, error: `network: ${e.message}` };
@@ -406,39 +405,106 @@ async function refreshEnterpriseLicense() {
     return lastEnterpriseInfo;
   }
   let json = null; try { json = text ? JSON.parse(text) : null; } catch {}
-  if (!res.ok) {
+
+  if (res.ok) {
+    // Happy path: enterprise has Copilot Enterprise tier, /billing returns seat_breakdown.
+    const sb = json?.seat_breakdown || {};
     lastEnterpriseInfo = {
-      ok: false,
-      status: res.status,
-      error: json?.message || text.slice(0, 200),
-      hint: res.status === 404
-        ? 'either Copilot Enterprise is not enabled, or the PAT lacks manage_billing:copilot scope'
-        : (res.status === 401 || res.status === 403 ? 'PAT rejected (check manage_billing:copilot scope)' : null),
+      ok: true,
+      enterprise: ENTERPRISE_SLUG,
+      tier: 'enterprise',
+      seats: {
+        total: sb.total ?? null,
+        active_this_cycle: sb.active_this_cycle ?? null,
+        pending_invitation: sb.pending_invitation ?? 0,
+        pending_cancellation: sb.pending_cancellation ?? 0,
+        added_this_cycle: sb.added_this_cycle ?? 0,
+        free: (typeof sb.total === 'number' && typeof sb.active_this_cycle === 'number')
+          ? Math.max(0, sb.total - sb.active_this_cycle - (sb.pending_invitation || 0))
+          : null,
+      },
+      seat_management_setting: json.seat_management_setting,
+      public_code_suggestions: json.public_code_suggestions,
+      ide_chat: json.ide_chat,
+      platform_chat: json.platform_chat,
+      cli: json.cli,
     };
     lastEnterpriseRefreshAt = Date.now();
     return lastEnterpriseInfo;
   }
-  const sb = json?.seat_breakdown || {};
+
+  // /billing 404 on Business-tier enterprises (the seat_breakdown endpoint
+  // is gated to Copilot Enterprise). Fall back to /billing/seats — that
+  // endpoint works on Business tier and gives us enough to populate the
+  // dashboard. Only the seat_breakdown.{pending_invitation,added_this_cycle}
+  // analytics are unavailable on Business; total + active are derived from
+  // the seats list itself.
+  if (res.status === 404) {
+    const seatsUrl = `https://api.github.com/enterprises/${encodeURIComponent(ENTERPRISE_SLUG)}/copilot/billing/seats?per_page=100`;
+    try {
+      const r2 = await fetch(seatsUrl, { headers: ghHeaders });
+      const t2 = await r2.text();
+      const j2 = t2 ? JSON.parse(t2) : null;
+      if (r2.ok && j2) {
+        const seats = Array.isArray(j2.seats) ? j2.seats : [];
+        const total = typeof j2.total_seats === 'number' ? j2.total_seats : seats.length;
+        const planTypes = new Set(seats.map(s => s.plan_type).filter(Boolean));
+        const pendingCancel = seats.filter(s => s.pending_cancellation_date).length;
+        const inferredTier = planTypes.has('enterprise') ? 'enterprise'
+          : planTypes.has('business')   ? 'business'
+          : 'unknown';
+        lastEnterpriseInfo = {
+          ok: true,
+          enterprise: ENTERPRISE_SLUG,
+          tier: inferredTier,
+          // Dashboard reads .seats.* — keep the same shape so no UI change needed.
+          seats: {
+            total,
+            active_this_cycle: total - pendingCancel,
+            pending_invitation: null,    // not exposed on /seats
+            pending_cancellation: pendingCancel,
+            added_this_cycle: null,
+            free: null,
+          },
+          fallback: 'billing-404 → /billing/seats (Copilot Business tier)',
+          // Surface the licensed seats inline so the dashboard can list assignees.
+          assignees: seats.map(s => ({
+            login: s.assignee?.login,
+            plan_type: s.plan_type,
+            last_activity_at: s.last_activity_at,
+            pending_cancellation_date: s.pending_cancellation_date,
+          })),
+        };
+        lastEnterpriseRefreshAt = Date.now();
+        return lastEnterpriseInfo;
+      }
+      // /billing/seats also failed — surface that specifically so the dashboard
+      // can distinguish "wrong scope" from "Enterprise tier needed".
+      lastEnterpriseInfo = {
+        ok: false,
+        status: r2.status,
+        error: (j2?.message) || t2.slice(0, 200),
+        hint: r2.status === 401 || r2.status === 403
+          ? 'PAT rejected by /billing/seats — check manage_billing:copilot scope and SSO authorization'
+          : `/billing/seats returned ${r2.status}; Copilot may not be enabled on this enterprise at all`,
+      };
+      lastEnterpriseRefreshAt = Date.now();
+      return lastEnterpriseInfo;
+    } catch (e) {
+      lastEnterpriseInfo = { ok: false, error: `seats-fallback network: ${e.message}` };
+      lastEnterpriseRefreshAt = Date.now();
+      return lastEnterpriseInfo;
+    }
+  }
+
+  // Non-404 error (auth, rate-limit, etc.).
   lastEnterpriseInfo = {
-    ok: true,
-    enterprise: ENTERPRISE_SLUG,
-    seats: {
-      total: sb.total ?? null,
-      active_this_cycle: sb.active_this_cycle ?? null,
-      pending_invitation: sb.pending_invitation ?? 0,
-      pending_cancellation: sb.pending_cancellation ?? 0,
-      added_this_cycle: sb.added_this_cycle ?? 0,
-      // Convenience field: best-effort "free" seat count. May be off when
-      // pending_cancellation has not yet zeroed out.
-      free: (typeof sb.total === 'number' && typeof sb.active_this_cycle === 'number')
-        ? Math.max(0, sb.total - sb.active_this_cycle - (sb.pending_invitation || 0))
-        : null,
-    },
-    seat_management_setting: json.seat_management_setting,
-    public_code_suggestions: json.public_code_suggestions,
-    ide_chat: json.ide_chat,
-    platform_chat: json.platform_chat,
-    cli: json.cli,
+    ok: false,
+    status: res.status,
+    error: json?.message || text.slice(0, 200),
+    hint: (res.status === 401 || res.status === 403)
+      ? 'PAT rejected (check manage_billing:copilot scope + SSO authorization for this enterprise)'
+      : null,
   };
   lastEnterpriseRefreshAt = Date.now();
   return lastEnterpriseInfo;
