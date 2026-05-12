@@ -47,10 +47,25 @@ function flag(name) { return process.argv.includes(name); }
 
 const tenant      = arg('--tenant') || process.env.GHE_EMU_TENANT_ID || 'organizations';
 const clientId    = arg('--client-id') || process.env.GHE_GRAPH_CLIENT_ID || '14d82eec-204b-4c2f-b7e8-296a70dab67e';
+// Scope list. Add a new scope here if a downstream script needs an
+// API call that's not covered. All scopes are admin-consent so the
+// signing user must be Global Admin (or have the role that consents
+// to each scope) the FIRST time — subsequent token mints in the same
+// tenant reuse the consent.
 const scope       = arg('--scope') || [
   'https://graph.microsoft.com/Application.ReadWrite.All',
   'https://graph.microsoft.com/AppRoleAssignment.ReadWrite.All',
   'https://graph.microsoft.com/Directory.ReadWrite.All',
+  // Added 2026-05-12: needed to pre-register an email/phone method for
+  // a freshly-created EMU user so they can clear the SSPR registration
+  // interrupt without owning a real phone. Requires the signing user
+  // to hold Authentication Administrator (or Global Admin).
+  'https://graph.microsoft.com/UserAuthenticationMethod.ReadWrite.All',
+  // Added 2026-05-12: lets ghe-onboard-user.cjs / cleanup scripts hard
+  // -delete test Entra users instead of leaving stub shells behind.
+  // User.ReadWrite.All is broader than necessary (we only DELETE), but
+  // there's no narrower scope for user lifecycle.
+  'https://graph.microsoft.com/User.ReadWrite.All',
   'offline_access',
 ].join(' ');
 const wantRefresh = flag('--refresh');
