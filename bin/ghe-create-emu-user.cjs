@@ -470,6 +470,41 @@ async function waitForScimUser(targetExternalId, deadlineMs) {
     }
   }
 
+  // 2b. Pre-register a recovery email method so the user can complete
+  //     M365 first sign-in without being stopped by the tenant's SSPR
+  //     registration interrupt CA policy. Without this the new user
+  //     deadlocks on "Let's keep your account secure" the moment they
+  //     enter their initial password — no Authenticator, no phone, no
+  //     way through. Pre-registering an arbitrary email satisfies the
+  //     "registered for SSPR" check and lets the user breeze through to
+  //     the password-change page → GitHub SSO → OAuth Authorize. The
+  //     email used is a synthetic recovery address; the user never has
+  //     to receive mail there because we don't actually exercise SSPR.
+  //     Requires UserAuthenticationMethod.ReadWrite.All on the Graph
+  //     token (ghe-mint-graph.cjs >= 2026-05-12). Silently skipped if
+  //     the scope is missing (HTTP 403) — logged as a warning so the
+  //     operator can re-mint the token or do step B manually.
+  let authMethodPreReg = null;
+  try {
+    const recoveryEmail = arg('--recovery-email') || `${emailPrefix}-recovery@${user.userPrincipalName.split('@')[1]}`;
+    const a = await graph('POST', `/users/${user.id}/authentication/emailMethods`, {
+      emailAddress: recoveryEmail,
+    });
+    authMethodPreReg = { registered: true, methodId: a.id, emailAddress: recoveryEmail };
+    console.log(`[mfa]   pre-registered recovery email ${recoveryEmail} (methodId=${a.id}) — SSPR interrupt will be skipped on first sign-in`);
+  } catch (e) {
+    if (e.status === 403) {
+      authMethodPreReg = { registered: false, reason: 'Graph token lacks UserAuthenticationMethod.ReadWrite.All' };
+      console.warn(`[mfa]   skipped — Graph token doesn't have UserAuthenticationMethod.ReadWrite.All scope. Re-mint with ghe-mint-graph.cjs (>= 2026-05-12). Without this the user will hit a SSPR registration interrupt on M365 first sign-in and step B will block.`);
+    } else if (e.status === 409 || /already exists|conflict/i.test(e.message || '')) {
+      authMethodPreReg = { registered: true, note: 'method already existed (idempotent re-run)' };
+      console.log(`[mfa]   recovery email already registered (idempotent re-run, OK)`);
+    } else {
+      authMethodPreReg = { registered: false, reason: `HTTP ${e.status}: ${e.message?.slice(0, 200)}` };
+      console.warn(`[mfa]   pre-registration failed (HTTP ${e.status}): ${e.message?.slice(0, 200)}`);
+    }
+  }
+
   // 3. Optional SCIM poll.
   let scimUser = null;
   if (waitScim && !noWait) {
@@ -606,6 +641,7 @@ async function waitForScimUser(targetExternalId, deadlineMs) {
       resolvedGithubLogin,
       teamMembership,
     },
+    authMethodPreReg,
     initialPassword: password, // print once; nowhere is this kept
     nextSteps: [
       `1. Have the user sign in once at https://login.microsoftonline.com with ${user.userPrincipalName} (they will be forced to change the password).`,
