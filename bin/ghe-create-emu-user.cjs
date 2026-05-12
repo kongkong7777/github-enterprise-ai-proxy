@@ -267,16 +267,27 @@ function genPassword() {
 
 // ─── Copilot Enterprise seat assignment ──────────────────────────────────
 //
-// EMU enterprises with Copilot Enterprise billing manage seats at the
-// enterprise level (centralized), not per-org. The endpoint is:
+// Two assignment paths exist with very different billing consequences:
 //
-//   POST /enterprises/{enterprise}/copilot/billing/selected_users
-//   { "selected_usernames": ["alice_carizon-gh"] }
+//   (A) ORG-level (preferred):
+//       POST /orgs/{org}/copilot/billing/selected_users
+//       Seat is billed at the tier the org's Copilot subscription holds.
+//       For carizon-dev (which has Copilot Enterprise attached at the
+//       org level — `$39/seat` per the org settings page), this grants a
+//       genuine Enterprise tier seat with 1000 premium_interactions/mo.
+//       This is the path you want for paying customers.
 //
-// Returns { seats_created: N }. Requires `manage_billing:copilot` scope on
-// the PAT — a `ghu_` OAuth token cannot do this even if the user is an
-// Enterprise Owner; you need a real PAT (classic) or fine-grained PAT
-// granted at the enterprise level.
+//   (B) ENTERPRISE-level (legacy fallback):
+//       POST /enterprises/{enterprise}/copilot/billing/selected_users
+//       Seat is billed at the enterprise's subscription tier, which for
+//       carizon-gh is Copilot Business ($19/seat, 300 premium/mo). This
+//       path is also what GitHub falls back to when the enterprise has
+//       Business but no org-level Enterprise add-on.
+//
+// We try (A) first if GHE_EMU_ASSIGN_ORG is set, then fall back to (B).
+// Both require a PAT with `manage_billing:copilot` (admin:enterprise also
+// covers it). A `ghu_` OAuth token can't do either even if the user is an
+// Enterprise Owner — needs a real PAT (classic or fine-grained).
 async function assignCopilotEnterpriseSeat(login) {
   if (!copilotAdminPat) {
     return {
@@ -285,26 +296,67 @@ async function assignCopilotEnterpriseSeat(login) {
       manualUrl: `https://github.com/enterprises/${enterpriseSlug}/copilot/seats`,
     };
   }
+  const baseHeaders = {
+    Authorization: `Bearer ${copilotAdminPat}`,
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'Content-Type': 'application/json',
+    'User-Agent': 'ghe-create-emu-user.cjs',
+  };
+
+  // (A) Org-level path. Default to GHE_EMU_ASSIGN_ORG if set, otherwise the
+  // single-org carizon-dev convention; pass --assign-org to override.
+  const assignOrg = arg('--assign-org') || process.env.GHE_EMU_ASSIGN_ORG;
+  if (assignOrg) {
+    const url = `https://api.github.com/orgs/${encodeURIComponent(assignOrg)}/copilot/billing/selected_users`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: baseHeaders,
+      body: JSON.stringify({ selected_usernames: [login] }),
+    });
+    const text = await res.text();
+    let json = null; try { json = text ? JSON.parse(text) : null; } catch {}
+    if (res.status === 201 || res.status === 200) {
+      return {
+        assigned: true,
+        tier: 'enterprise', // org-level grant on an Enterprise-attached org
+        response: json,
+        status: res.status,
+        note: `via org ${assignOrg} (Copilot Enterprise tier)`,
+      };
+    }
+    if (res.status === 422 && /already.*assigned|already has a Copilot subscription/i.test(text)) {
+      return {
+        assigned: true, tier: 'enterprise', response: json, status: res.status,
+        note: `via org ${assignOrg} — already had a seat`,
+      };
+    }
+    // Soft-fall through to enterprise-level path; log the org failure so
+    // the operator knows why we didn't get Enterprise tier.
+    console.warn(`[copilot] org-level grant failed (HTTP ${res.status}): ${json?.message || text.slice(0, 200)}`);
+    console.warn(`[copilot] falling back to enterprise-level seat (Business tier).`);
+  }
+
+  // (B) Enterprise-level fallback.
   const url = `https://api.github.com/enterprises/${encodeURIComponent(enterpriseSlug)}/copilot/billing/selected_users`;
   const res = await fetch(url, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${copilotAdminPat}`,
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      'Content-Type': 'application/json',
-      'User-Agent': 'ghe-create-emu-user.cjs',
-    },
+    headers: baseHeaders,
     body: JSON.stringify({ selected_usernames: [login] }),
   });
   const text = await res.text();
   let json = null; try { json = text ? JSON.parse(text) : null; } catch {}
   if (res.status === 201 || res.status === 200) {
-    return { assigned: true, response: json, status: res.status };
+    return {
+      assigned: true,
+      tier: 'business', // enterprise-level grant tracks the enterprise subscription
+      response: json,
+      status: res.status,
+      note: assignOrg ? 'fell back to enterprise-level (Business tier)' : 'enterprise-level (Business tier)',
+    };
   }
-  // 422 with "already assigned" should be treated as a benign idempotent success.
   if (res.status === 422 && /already.*assigned|already has a Copilot subscription/i.test(text)) {
-    return { assigned: true, response: json, status: res.status, note: 'already had a seat' };
+    return { assigned: true, tier: 'business', response: json, status: res.status, note: 'already had a seat' };
   }
   return {
     assigned: false,
