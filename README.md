@@ -259,6 +259,27 @@ node bin/ghe-mint-oauth.cjs --account dev2_carizon
 - **Login suffix is fixed**: every managed user gets `<email-prefix>_<enterprise-shortcode>`. The shortcode is *not* the URL slug; check what the setup user's login looks like (e.g. `kongkong_admin` → shortcode is `kongkong`).
 - **OAuth still goes through `Iv1.b507a08c87ecfe98`** (GitHub's well-known Copilot Plugin OAuth client). The user's browser will redirect through Entra OIDC during the Authorize step — this is the only step that *requires* a real browser session.
 
+### EMU sign-in trick — using a single browser for multiple users
+
+If you're the operator driving the mint-oauth flow for several EMU users from one browser (e.g. helping a few new hires onboard sequentially), you'll quickly hit a sticky problem: github.com's `_gh_sess` cookie is HttpOnly and survives both `/logout` and clearing every cookie you can reach from JS, **and** if you're still signed in to Microsoft as the previous user, github silently re-establishes that user's session on the next page load. The "Use a different account" link on the device-flow page sends you to `/login?add_account=1` — which shows a native username/password form that EMU users cannot use (managed users have no GitHub-side password).
+
+The escape hatch isn't documented but is built into that same form. **Type the EMU user's GitHub login (e.g. `dev3_kongkong`) in the username field and ANYTHING in the password field, then look at the submit button**: github sniffs the username, detects the EMU suffix, and rewrites the button label to "**Sign in with your identity provider**". Clicking it skips the password check entirely and redirects through `/enterprises/{slug}/sso?add_account=1` → MSFT account picker → pick the right Entra identity → back to github with a fresh session for that user, while preserving the previous user's session in the multi-account picker.
+
+End-to-end for switching from `dev2_kongkong` (currently signed in) to `dev3_kongkong`:
+
+```
+1. https://github.com/login?add_account=1&return_to=/login/device
+2. Username field: dev3_kongkong
+3. Password field: anything (will not be checked)
+4. Button now reads "Sign in with your identity provider" — click it
+5. /enterprises/carizon-gh/sso?add_account=1 → Continue
+6. MSFT picker → Dev 3 → enter dev3's password
+7. Back at /login/device — dev3_kongkong appears with Continue; dev2 +
+   any other previous accounts remain as Select-able
+```
+
+Without this trick, the only other path is a different browser / incognito / fresh device — which is fine for the actual end user (dev3 doing it themselves), but kills any batch onboarding from a single operator console.
+
 ### Copilot 席位（license）自动分配 — 需要一个高权限 PAT
 
 `ghe-create-emu-user.cjs` 默认只把账号建到 Entra + 通过 SCIM 推到 GitHub，**不**自动给新账号分配 Copilot Enterprise 席位 — 因为席位 API 要 `manage_billing:copilot` scope，而 `ghe-mint-oauth.cjs` 拿到的 `ghu_` OAuth token 拿不到这个 scope（即便用户是 Enterprise Owner 也不行，OAuth App 不暴露 billing scope）。
